@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "strands-acp-client"
 dynamic = ["version"]
-description = "Use ACP coding agents (Claude Code, Codex, Gemini CLI, Kiro CLI, Strands CLI) as tools from a Strands agent: delegate a task, get the result back."
+description = "Use ACP coding agents (Claude Code, OpenCode, the Strands CLI or any other) as tools from a Strands agent: delegate a task, get the result back."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Jose Pablo Ramírez Méndez", email = "pablo.dev.rz.mz@gmail.com"}
 ]
-keywords = ["strands", "agents", "ai", "tool", "acp", "agent-client-protocol", "coding-agents", "claude-code", "codex"]
+keywords = ["strands", "agents", "ai", "tool", "acp", "agent-client-protocol", "coding-agents", "claude-code", "opencode"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

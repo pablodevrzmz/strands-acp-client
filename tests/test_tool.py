@@ -33,13 +33,18 @@ def test_allow_all_is_marked_destructive(tmp_path):
 
 
 def test_agents_argument_shapes(tmp_path):
-    by_names = make_acp_agent(agents=["claude", "codex"], cwd=tmp_path)
-    assert by_names.tool_spec["inputSchema"]["json"]["properties"]["agent_name"]["enum"] == ["claude", "codex"]
-    single = make_acp_agent(agents="gemini", cwd=tmp_path)
-    assert single.tool_spec["inputSchema"]["json"]["properties"]["agent_name"]["enum"] == ["gemini"]
+    by_names = make_acp_agent(agents=["claude", "opencode"], cwd=tmp_path)
+    assert by_names.tool_spec["inputSchema"]["json"]["properties"]["agent_name"]["enum"] == ["claude", "opencode"]
+    single = make_acp_agent(agents="strands", cwd=tmp_path)
+    assert single.tool_spec["inputSchema"]["json"]["properties"]["agent_name"]["enum"] == ["strands"]
     custom = make_acp_agent(agents={"mine": AgentCommand(("my-agent", "--acp"), "my agent")}, cwd=tmp_path)
     assert "mine (my agent)" in custom.tool_spec["description"]
-    assert set(KNOWN_AGENTS) >= {"claude", "codex", "gemini", "copilot", "kiro", "opencode", "strands"}
+    # Presets exist only for agents the end-to-end suite has driven for real.
+    assert set(KNOWN_AGENTS) == {"claude", "opencode", "strands"}
+    with pytest.raises(ValueError, match="Pass argv explicitly"):
+        make_acp_agent(agents=["gemini"], cwd=tmp_path)
+    unverified = make_acp_agent(agents={"gemini": ["npx", "-y", "@google/gemini-cli", "--acp"]}, cwd=tmp_path)
+    assert unverified.tool_spec["inputSchema"]["json"]["properties"]["agent_name"]["enum"] == ["gemini"]
 
 
 def test_factory_rejects_bad_arguments(tmp_path):

@@ -1,4 +1,4 @@
-"""Use ACP coding agents (Claude Code, Codex, Gemini CLI, Kiro CLI, Strands CLI...) as tools from a Strands agent."""
+"""Use ACP coding agents (Claude Code, OpenCode, the Strands CLI or any other) as tools from a Strands agent."""
 
 from importlib.metadata import PackageNotFoundError, version
 
