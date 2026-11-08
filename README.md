@@ -5,10 +5,10 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 Use coding agents as tools from a [Strands Agents](https://strandsagents.com) agent, over the
-[Agent Client Protocol](https://agentclientprotocol.com) (ACP): Claude Code, Codex, Gemini CLI,
-GitHub Copilot CLI, Kiro CLI, OpenCode, Qwen Code, a Strands agent served by the Strands CLI, or any
-other ACP agent. Your agent delegates a task, the coding agent works in a directory with its own
-tools, and the final answer comes back as a tool result together with a `session_id` for follow-ups.
+[Agent Client Protocol](https://agentclientprotocol.com) (ACP). Verified end to end with Claude Code,
+OpenCode and a Strands agent served by the Strands CLI; any other ACP agent plugs in by its command.
+Your agent delegates a task, the coding agent works in a directory with its own tools, and the final
+answer comes back as a tool result together with a `session_id` for follow-ups.
 
 ACP has two halves. The *Agent* half exposes an agent to editors like Zed; for Strands that already
 exists as [strands-acp](https://github.com/ryancormack/strands-acp) (TypeScript). This package is the
@@ -21,10 +21,10 @@ task and decides its permission requests.
 pip install strands-acp-client
 ```
 
-The agents themselves are separate programs. Most official adapters run through `npx`, so Node.js 20+
-must be on `PATH`, and each agent needs its own login or API key exactly as it does in a terminal
-(for example `claude login` for Claude Code, `codex login` for Codex). Kiro CLI and OpenCode ship as
-binaries you install first.
+The agents themselves are separate programs. Claude Code's adapter and the Strands CLI run through
+`npx`, so Node.js 20+ must be on `PATH`; OpenCode is a binary you install first. Each agent needs its
+own login or model provider exactly as it does in a terminal (for example `claude auth login` for
+Claude Code, or a local Ollama model for the Strands CLI).
 
 For unattended runs, give the agent a credential that does not depend on an interactive login. Claude Code
 issues long-lived tokens with `claude setup-token`; pass one as `CLAUDE_CODE_OAUTH_TOKEN` through the
@@ -53,7 +53,7 @@ from strands import Agent
 from strands_acp_client import make_acp_agent
 
 acp_agent = make_acp_agent(
-    agents=["claude", "codex"],  # known agents, or your own commands (see below)
+    agents=["claude", "opencode"],  # verified agents, or your own commands (see below)
     cwd="./repo",                # where the coding agents work
     timeout=900,                 # seconds per delegated task
     permissions="read_only",     # what the coding agent may do without asking you
@@ -83,20 +83,19 @@ elapsed time.
 ## Agents
 
 `agents` accepts a list of known names, a single name, or a mapping of your own names to launch
-commands. Commands are taken from the [ACP registry](https://github.com/agentclientprotocol/registry):
+commands. A name becomes known only after the end-to-end suite has driven that agent for real, so the
+list is short on purpose:
 
-| Name | Command | Notes |
+| Name | Command | Verified with |
 | --- | --- | --- |
-| `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Claude Code through the official adapter |
-| `codex` | `npx -y @agentclientprotocol/codex-acp` | OpenAI Codex CLI through the official adapter |
-| `gemini` | `npx -y @google/gemini-cli --acp` | Gemini CLI |
-| `copilot` | `npx -y @github/copilot --acp` | GitHub Copilot CLI |
-| `qwen` | `npx -y @qwen-code/qwen-code --acp` | Qwen Code |
-| `kiro` | `kiro-cli acp` | Kiro CLI, installed separately |
-| `opencode` | `opencode acp` | OpenCode binary, installed separately |
-| `strands` | `npx -y @strands-agents/cli --acp-server` | A Strands agent served by the Strands CLI |
+| `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Claude Code 2.1, adapter 0.101 |
+| `opencode` | `opencode acp` | OpenCode 1.18 |
+| `strands` | `npx -y @strands-agents/cli --acp-server` | Strands CLI 0.2.4 on a local Ollama model |
 
-Anything that speaks ACP on stdin/stdout works:
+Anything else that speaks ACP on stdin/stdout works by passing its command; the
+[ACP registry](https://github.com/agentclientprotocol/registry) lists them. An agent outside the table
+has not been checked here, so find out how it asks for permission before trusting a restrictive policy
+with it (see [A policy only answers questions](#a-policy-only-answers-questions)):
 
 ```python
 from strands_acp_client import AgentCommand, make_acp_agent
@@ -104,7 +103,7 @@ from strands_acp_client import AgentCommand, make_acp_agent
 acp_agent = make_acp_agent(
     agents={
         "claude": "claude",  # alias of a known agent
-        "reviewer": AgentCommand(("npx", "-y", "@agentclientprotocol/codex-acp"), "Codex, used for reviews"),
+        "reviewer": AgentCommand(("my-review-agent", "--acp"), "an agent tuned for code review"),
         "local": ["python", "my_acp_agent.py"],
     },
     default_agent="claude",

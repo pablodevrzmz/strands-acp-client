@@ -65,14 +65,6 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
         "Claude Code through the official ACP adapter",
         modes=_ASK_FIRST,
     ),
-    "codex": AgentCommand(
-        ("npx", "-y", "@agentclientprotocol/codex-acp"),
-        "OpenAI Codex CLI through the official ACP adapter",
-    ),
-    "gemini": AgentCommand(("npx", "-y", "@google/gemini-cli", "--acp"), "Gemini CLI"),
-    "copilot": AgentCommand(("npx", "-y", "@github/copilot", "--acp"), "GitHub Copilot CLI"),
-    "qwen": AgentCommand(("npx", "-y", "@qwen-code/qwen-code", "--acp"), "Qwen Code"),
-    "kiro": AgentCommand(("kiro-cli", "acp"), "Kiro CLI (kiro-cli must be installed)"),
     "opencode": AgentCommand(
         ("opencode", "acp"),
         "OpenCode (the opencode binary must be installed)",
@@ -84,7 +76,12 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
         policy_args={"read_only": _READ_TOOLS, "deny_all": _READ_TOOLS},
     ),
 }
-"""Launch commands taken from the ACP registry (https://github.com/agentclientprotocol/registry)."""
+"""Agents this package has been driven against end to end, with what was learned about each.
+
+An agent is added here only after the suite in ``tests/e2e`` passes against the real thing. Any other
+agent that speaks ACP works by passing its command (the ACP registry lists them:
+https://github.com/agentclientprotocol/registry), but nothing here has checked how it asks for permission.
+"""
 
 AgentsArg = Mapping[str, "Sequence[str] | AgentCommand | str"] | Sequence[str] | str | None
 """Accepted shapes for the ``agents`` argument of :func:`strands_acp_client.make_acp_agent`."""
