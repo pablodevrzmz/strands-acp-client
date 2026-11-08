@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 @tool
-def template_tool(param1: str) -> dict[str, Any]:
+def acp_client_tool(param1: str) -> dict[str, Any]:
     """Brief description of what your tool does.
 
     Args:

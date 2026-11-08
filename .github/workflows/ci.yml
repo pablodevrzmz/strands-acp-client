@@ -1,16 +1,10 @@
-name: CI - Python
+name: CI
 
 on:
   pull_request:
     branches: [ main ]
-    paths:
-      - 'python/**'
-      - '.github/workflows/ci-python.yml'
   push:
     branches: [ main ]
-    paths:
-      - 'python/**'
-      - '.github/workflows/ci-python.yml'
   schedule:
     # Weekly canary against the newest SDK release. The template's open
     # floor (strands-agents>=1.0.0) means new users always resolve the
@@ -25,9 +19,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    working-directory: python
 
 jobs:
   test:
