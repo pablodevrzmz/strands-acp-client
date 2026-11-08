@@ -33,7 +33,13 @@ from acp.schema import (
     WriteTextFileResponse,
 )
 
-from strands_acp_client._permissions import PermissionPolicy, PermissionRequest, decide
+from strands_acp_client._permissions import (
+    MUTATING_KINDS,
+    PermissionPolicy,
+    PermissionRequest,
+    decide,
+    policy_label,
+)
 
 __all__ = ["StrandsAcpClient", "Turn"]
 
@@ -54,6 +60,8 @@ class Turn:
         self.tool_calls: dict[str, dict[str, Any]] = {}
         self.allowed = 0
         self.denied = 0
+        self.asked: set[str] = set()
+        self.violation: dict[str, Any] | None = None
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     @property
@@ -73,10 +81,14 @@ class StrandsAcpClient(Client):
     agent uses its own tools, directly in the working directory it was started in.
     """
 
-    def __init__(self, agent_name: str, policy: PermissionPolicy) -> None:
+    def __init__(self, agent_name: str, policy: PermissionPolicy, strict: bool = True) -> None:
         self.agent_name = agent_name
         self.policy = policy
         self.turn: Turn | None = None
+        # A policy only answers questions. With ``strict`` the client also notices a change the
+        # agent made without asking, so a restrictive policy fails loudly instead of silently.
+        self.guard = strict and policy_label(policy) != "allow_all"
+        self._always_allowed: set[str] = set()
 
     def on_connect(self, conn: Agent) -> None:
         return None
@@ -105,6 +117,7 @@ class StrandsAcpClient(Client):
             }
             turn.tool_calls[update.tool_call_id] = entry
             turn.push({"type": "tool_call", **entry})
+            self._check(turn, entry)
         elif isinstance(update, ToolCallProgress):
             entry = turn.tool_calls.setdefault(
                 update.tool_call_id,
@@ -120,7 +133,20 @@ class StrandsAcpClient(Client):
                 entry["locations"] = [location.path for location in update.locations]
             if update.status in ("completed", "failed"):
                 turn.push({"type": "tool_call_update", **entry})
+            self._check(turn, entry)
         # Plans, available commands, mode and config changes are not needed for a delegated task.
+
+    def _check(self, turn: Turn, entry: dict[str, Any]) -> None:
+        """Flag a completed edit, delete, move or command that the agent never asked permission for."""
+        if not self.guard or turn.violation is not None:
+            return
+        kind = entry["kind"]
+        if entry["status"] != "completed" or kind not in MUTATING_KINDS:
+            return
+        if entry["id"] in turn.asked or kind in self._always_allowed:
+            return
+        turn.violation = {"tool_call_id": entry["id"], "title": entry["title"], "kind": kind}
+        turn.push({"type": "policy_violation", **turn.violation})
 
     # ── what the agent asks ──
 
@@ -137,13 +163,18 @@ class StrandsAcpClient(Client):
             options=tuple(options),
             raw_input=tool_call.raw_input,
         )
+        turn = self.turn
+        if turn is not None:
+            turn.asked.add(request.tool_call_id)
         try:
             response, allowed = await decide(self.policy, request)
         except Exception:
             logger.exception("permission handler failed for %s; refusing the call", request.title)
             response, allowed = RequestPermissionResponse(outcome=DeniedOutcome()), False
+        if allowed and request.kind and _selected_kind(response, options) == "allow_always":
+            # The agent will not ask again for this kind of call in this session.
+            self._always_allowed.add(request.kind)
 
-        turn = self.turn
         if turn is not None:
             if allowed:
                 turn.allowed += 1
@@ -228,6 +259,14 @@ class StrandsAcpClient(Client):
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         return None
+
+
+def _selected_kind(response: RequestPermissionResponse, options: list[PermissionOption]) -> str | None:
+    selected = getattr(response.outcome, "option_id", None)
+    for option in options:
+        if option.option_id == selected:
+            return str(option.kind)
+    return None
 
 
 def _text_of(content: Any) -> str:

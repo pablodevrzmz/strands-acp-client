@@ -90,6 +90,9 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+    "e2e: runs against real coding agents; needs ACP_E2E_AGENTS and the agents logged in",
+]
 filterwarnings = [
     # pytest-asyncio still touches the event loop policy; Python 3.14 deprecates it.
     "ignore:.*event_loop_policy.*:DeprecationWarning",

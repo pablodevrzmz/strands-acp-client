@@ -18,7 +18,7 @@ from acp.schema import ClientCapabilities, Implementation, TextContentBlock
 
 from strands_acp_client._agents import AgentCommand
 from strands_acp_client._client import StrandsAcpClient, Turn
-from strands_acp_client._permissions import PermissionPolicy
+from strands_acp_client._permissions import PermissionPolicy, policy_label
 
 __all__ = ["AcpAgentError", "AcpSession", "SessionRegistry", "TurnResult"]
 
@@ -49,6 +49,7 @@ class TurnResult:
     thought_chars: int
     elapsed: float
     error: str | None = None
+    violation: dict[str, Any] | None = None
 
 
 class AcpSession:
@@ -60,15 +61,18 @@ class AcpSession:
         command: AgentCommand,
         cwd: str,
         policy: PermissionPolicy,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
         cancel_grace: float = 10.0,
+        strict: bool = True,
     ) -> None:
         self.agent_name = agent_name
         self.command = command
         self.cwd = cwd
         self.cancel_grace = cancel_grace
-        self.client = StrandsAcpClient(agent_name, policy)
+        self.policy_label = policy_label(policy)
+        self.client = StrandsAcpClient(agent_name, policy, strict=strict)
         self.session_id: str = ""
+        self.mode: str | None = None
         self.resumed = False
         self.agent_info: dict[str, Any] | None = None
         self.supports_load = False
@@ -88,10 +92,12 @@ class AcpSession:
         self.loop = asyncio.get_running_loop()
         self._lock = asyncio.Lock()
         env = dict(os.environ)
-        if self.command.env:
-            env.update(self.command.env)
-        if self._env:
-            env.update(self._env)
+        for changes in (self.command.env, self._env):
+            for key, value in (changes or {}).items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
 
         stack = AsyncExitStack()
         try:
@@ -124,23 +130,43 @@ class AcpSession:
             self.supports_load = bool(init.agent_capabilities and init.agent_capabilities.load_session)
 
             if session_id is None:
-                created = await self._conn.new_session(cwd=self.cwd, mcp_servers=[])
-                self.session_id = created.session_id
+                opened = await self._conn.new_session(cwd=self.cwd, mcp_servers=[])
+                self.session_id = opened.session_id
             else:
                 if not self.supports_load:
                     raise AcpAgentError(
                         f"session {session_id!r} is not held by this process and agent {self.agent_name!r} "
                         "cannot resume sessions; start a new one"
                     )
-                await self._conn.load_session(cwd=self.cwd, session_id=session_id, mcp_servers=[])
+                opened = await self._conn.load_session(cwd=self.cwd, session_id=session_id, mcp_servers=[])
                 self.session_id = session_id
                 self.resumed = True
+            await self._select_mode(opened)
         except AcpAgentError:
             await self.close()
             raise
         except Exception as exc:
             await self.close()
             raise AcpAgentError(f"agent {self.agent_name!r} failed during setup: {exc}") from exc
+
+    async def _select_mode(self, opened: Any) -> None:
+        """Switch the session to the mode this agent needs for the current policy, if it offers it."""
+        wanted = (self.command.modes or {}).get(self.policy_label)
+        if not wanted or opened is None:
+            return
+        modes = getattr(opened, "modes", None)
+        if modes is not None and any(mode.id == wanted for mode in modes.available_modes):
+            if modes.current_mode_id != wanted:
+                await self._conn.set_session_mode(session_id=self.session_id, mode_id=wanted)
+            self.mode = wanted
+            return
+        for option in getattr(opened, "config_options", None) or []:
+            if getattr(option, "id", None) == "mode" and wanted in _select_values(option):
+                if getattr(option, "current_value", None) != wanted:
+                    await self._conn.set_config_option(config_id="mode", session_id=self.session_id, value=wanted)
+                self.mode = wanted
+                return
+        logger.info("agent %r does not offer mode %r; relying on its own defaults", self.agent_name, wanted)
 
     @property
     def alive(self) -> bool:
@@ -197,6 +223,9 @@ class AcpSession:
             cancel_reason: str | None = None
             try:
                 while not task.done():
+                    if turn.violation is not None:
+                        cancel_reason = "policy_violation"
+                        break
                     if cancel_signal is not None and cancel_signal.is_set():
                         cancel_reason = "cancelled"
                         break
@@ -214,7 +243,9 @@ class AcpSession:
                         getter.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await getter
-                if cancel_reason is not None:
+                if cancel_reason is None and turn.violation is not None:
+                    cancel_reason = "policy_violation"
+                if cancel_reason is not None and not task.done():
                     await self._cancel_turn(task)
                 while not turn.events.empty():
                     yield turn.events.get_nowait()
@@ -244,25 +275,30 @@ class AcpSession:
     ) -> TurnResult:
         usage: dict[str, Any] | None = None
         error: str | None = None
-        if task.done() and not task.cancelled() and task.exception() is None:
+        stop_reason = "error"
+        finished = task.done() and not task.cancelled() and task.exception() is None
+        if finished:
             response = task.result()
             stop_reason = str(response.stop_reason)
             if response.usage is not None:
                 usage = response.usage.model_dump(exclude_none=True, by_alias=False)
-            if cancel_reason == "timeout":
-                stop_reason = "timeout"
-                error = f"the agent did not finish within {timeout:.0f}s and was cancelled"
-            elif cancel_reason == "cancelled":
-                stop_reason = "cancelled"
-                error = "the task was cancelled by the caller"
-        elif cancel_reason == "timeout":
+
+        if cancel_reason == "timeout":
             stop_reason = "timeout"
-            error = f"the agent did not finish within {timeout:.0f}s and did not react to cancellation"
+            reaction = "was cancelled" if finished else "did not react to cancellation"
+            error = f"the agent did not finish within {timeout:.0f}s and {reaction}"
         elif cancel_reason == "cancelled":
             stop_reason = "cancelled"
             error = "the task was cancelled by the caller"
-        else:
-            stop_reason = "error"
+        elif cancel_reason == "policy_violation":
+            stop_reason = "policy_violation"
+            violation = turn.violation or {}
+            error = (
+                f"the agent ran {violation.get('title') or 'a tool'!r} ({violation.get('kind')}) without asking "
+                f"for permission, so the {self.policy_label} policy could not be enforced and the turn was "
+                "stopped; that change may already have been made"
+            )
+        elif not finished:
             exc = task.exception() if task.done() and not task.cancelled() else None
             error = _describe_failure(exc)
         return TurnResult(
@@ -275,7 +311,20 @@ class AcpSession:
             thought_chars=turn.thought_chars,
             elapsed=elapsed,
             error=error,
+            violation=turn.violation,
         )
+
+
+def _select_values(option: Any) -> list[str]:
+    """Values of a select config option, whether it lists options directly or in groups."""
+    values: list[str] = []
+    for item in getattr(option, "options", None) or []:
+        nested = getattr(item, "options", None)
+        if nested is not None:
+            values.extend(str(inner.value) for inner in nested)
+        else:
+            values.append(str(item.value))
+    return values
 
 
 def _describe_failure(exc: BaseException | None) -> str:
@@ -318,8 +367,9 @@ class SessionRegistry:
         cwd: str,
         session_id: str | None,
         policy: PermissionPolicy,
-        env: Mapping[str, str] | None,
+        env: Mapping[str, str | None] | None,
         cancel_grace: float,
+        strict: bool = True,
     ) -> AcpSession:
         loop = asyncio.get_running_loop()
         if session_id is not None:
@@ -329,7 +379,7 @@ class SessionRegistry:
                     held.touch()
                     return held
                 await self._drop(held)
-        session = AcpSession(agent_name, command, cwd, policy, env=env, cancel_grace=cancel_grace)
+        session = AcpSession(agent_name, command, cwd, policy, env=env, cancel_grace=cancel_grace, strict=strict)
         await session.start(session_id=session_id)
         self._sessions[session.session_id] = session
         await self._evict()

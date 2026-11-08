@@ -275,5 +275,96 @@ async def test_agent_runs_in_the_requested_cwd(make_tool, run_tool, tmp_path):
     assert os.path.dirname(seen[0]) == str(other.resolve())
 
 
+async def test_env_changes_reach_the_agent_and_none_unsets(make_tool, run_tool, monkeypatch):
+    monkeypatch.setenv("FAKE_PARENT_VAR", "from-parent")
+    built = make_tool(env={"FAKE_PARENT_VAR": None, "FAKE_EXTRA_VAR": "from-tool"})
+    _, hidden = await run_tool(built, task="env FAKE_PARENT_VAR")
+    assert result_text(hidden) == "<unset>"
+    _, extra = await run_tool(built, task="env FAKE_EXTRA_VAR")
+    assert result_text(extra) == "from-tool"
+    inherited = make_tool()
+    _, kept = await run_tool(inherited, task="env FAKE_PARENT_VAR")
+    assert result_text(kept) == "from-parent"
+
+
 def test_fake_agent_runs_under_this_interpreter():
     assert FAKE_ARGV[0] == sys.executable
+
+
+# ── a policy only answers questions: the agent has to ask, and the tool checks that it did ──
+
+
+async def test_unasked_edit_is_a_policy_violation(make_tool, run_tool):
+    built = make_tool()
+    events, result = await run_tool(built, task="sneak edit")
+    assert result["status"] == "error"
+    details = result_json(result)
+    assert details["stop_reason"] == "policy_violation"
+    assert details["policy_violation"] == {"tool_call_id": "sneak-1", "title": "edit example.txt", "kind": "edit"}
+    assert "without asking for permission" in result_text(result)
+    assert "nobody stopped me" not in result_text(result), "the turn must be cancelled, not left to finish"
+    assert any(event["type"] == "policy_violation" for event in events)
+    assert len(built.acp_sessions) == 0
+
+
+async def test_unasked_reads_are_fine_and_allow_all_is_not_guarded(make_tool, run_tool):
+    _, read = await run_tool(make_tool(), task="sneak read 0.2")
+    assert read["status"] == "success" and "nobody stopped me" in result_text(read)
+    _, edit = await run_tool(make_tool(permissions="allow_all"), task="sneak edit 0.2")
+    assert edit["status"] == "success"
+    assert "policy_violation" not in result_json(edit)
+
+
+async def test_strict_false_lets_unasked_changes_through(make_tool, run_tool):
+    _, result = await run_tool(make_tool(strict=False), task="sneak execute 0.2")
+    assert result["status"] == "success"
+    details = result_json(result)
+    assert details["tool_calls"][0]["status"] == "completed"
+    assert "policy_violation" not in details
+
+
+async def test_allow_always_from_a_handler_is_remembered(make_tool, run_tool):
+    built = make_tool(permissions=lambda request: "allow-always")
+    _, first = await run_tool(built, task="tool edit")
+    assert "permission allowed via allow-always" in result_text(first)
+    # The agent was told "always" for edits, so it is entitled not to ask again in this session.
+    _, second = await run_tool(built, task="sneak edit 0.2", session_id=result_json(first)["session_id"])
+    assert second["status"] == "success"
+
+
+async def test_restrictive_policy_selects_the_agents_asking_mode(make_tool, run_tool):
+    command = AgentCommand(FAKE_ARGV, "fake", modes={"read_only": "ask"})
+    env = {"FAKE_ACP_MODES": "ask,auto"}
+    built = make_tool(agents={"fake": command}, env=env)
+    _, result = await run_tool(built, task="mode")
+    assert result_text(result) == "mode ask"
+    assert result_json(result)["mode"] == "ask"
+
+    permissive = make_tool(agents={"fake": command}, env=env, permissions="allow_all")
+    _, result = await run_tool(permissive, task="mode")
+    assert result_text(result) == "mode auto"
+    assert result_json(result)["mode"] is None
+
+
+async def test_mode_is_selected_through_the_config_option(make_tool, run_tool):
+    command = AgentCommand(FAKE_ARGV, "fake", modes={"read_only": "plan"})
+    env = {"FAKE_ACP_CONFIG_MODES": "build,plan", "FAKE_ACP_MODE": "build"}
+    _, result = await run_tool(make_tool(agents={"fake": command}, env=env), task="mode")
+    assert result_text(result) == "mode plan"
+    assert result_json(result)["mode"] == "plan"
+
+
+async def test_a_mode_the_agent_does_not_offer_is_skipped(make_tool, run_tool):
+    command = AgentCommand(FAKE_ARGV, "fake", modes={"read_only": "nope"})
+    _, result = await run_tool(make_tool(agents={"fake": command}, env={"FAKE_ACP_MODES": "ask,auto"}), task="mode")
+    assert result_text(result) == "mode auto"
+    assert result_json(result)["mode"] is None
+
+
+def test_known_agents_carry_their_asking_modes():
+    from strands_acp_client._agents import resolve_agents
+
+    pinned = resolve_agents({"claude": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.101.0"]})
+    assert pinned["claude"].modes == {"read_only": "default", "deny_all": "default", "custom": "default"}
+    assert resolve_agents(["opencode"])["opencode"].modes == {"read_only": "plan", "deny_all": "plan"}
+    assert resolve_agents({"mine": ["my-agent"]})["mine"].modes is None

@@ -17,6 +17,7 @@ from typing import Any, Literal, Union
 from acp.schema import AllowedOutcome, DeniedOutcome, PermissionOption, RequestPermissionResponse
 
 __all__ = [
+    "MUTATING_KINDS",
     "READ_ONLY_KINDS",
     "PermissionDecision",
     "PermissionHandler",
@@ -32,6 +33,9 @@ PermissionPolicyName = Literal["allow_all", "read_only", "deny_all"]
 
 READ_ONLY_KINDS: frozenset[str] = frozenset({"read", "search", "fetch", "think"})
 """ACP tool kinds that the ``read_only`` policy allows; everything else (edit, delete, move, execute...) is refused."""
+
+MUTATING_KINDS: frozenset[str] = frozenset({"edit", "delete", "move", "execute"})
+"""ACP tool kinds that change things. Under any policy but ``allow_all`` the agent must ask before running one."""
 
 
 @dataclass(frozen=True)

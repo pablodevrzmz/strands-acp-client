@@ -31,6 +31,21 @@ issues long-lived tokens with `claude setup-token`; pass one as `CLAUDE_CODE_OAU
 factory's `env`, or through the agent's own `AgentCommand(env=...)`. An expired login surfaces as an error
 result that quotes the agent's message, so the model can report it instead of retrying blindly.
 
+`env` is applied over the environment of your process, and a value of `None` removes a variable. That
+matters when your code itself runs inside a Claude Code session: the nested Claude Code inherits the
+host session's variables and refuses to authenticate. Hide them and it uses its own stored login:
+
+```python
+import os
+
+hide_host_session = {
+    key: None
+    for key in os.environ
+    if key == "CLAUDECODE" or key.startswith(("CLAUDE_CODE_", "CLAUDE_AGENT_SDK_"))
+}
+acp_agent = make_acp_agent(agents=["claude"], env=hide_host_session)
+```
+
 ## Quick start
 
 ```python
@@ -124,6 +139,41 @@ can explain itself or try something else; the turn is not aborted. To gate the d
 this task worth handing to a coding agent at all?), use a Strands intervention handler on the
 `acp_agent` tool call, as you would for any other tool.
 
+### A policy only answers questions
+
+A permission policy decides what to answer when the agent asks. Whether the agent asks is up to the
+agent, and many start in a mode that does not: Claude Code often starts in `auto`, OpenCode in `build`.
+Tested against the real agents, both edited a file under `read_only` without sending a single
+permission request. So the tool does two more things under every policy except `allow_all`:
+
+1. **It puts the agent in its asking mode.** Each known agent declares, per policy, the session mode in
+   which it defers to the client, and the tool selects it through ACP (`session/set_mode` or the `mode`
+   config option) when the agent offers it. The mode in use is reported as `mode` in the result.
+2. **It checks that the agent asked** (`strict=True`, the default). If an edit, delete, move or command
+   completes without a permission request, the turn is cancelled at once and the tool returns an error
+   with `stop_reason: "policy_violation"` naming the call, instead of a success that hides it.
+
+| Agent | Starts in | Under a restrictive policy | An edit under `read_only` |
+| --- | --- | --- | --- |
+| `claude` | your Claude Code settings, often `auto` | switched to `default` ("always ask before making changes") | the agent asks, the policy refuses |
+| `opencode` | `build` | switched to `plan` for `read_only` and `deny_all` | the agent declines on its own |
+| others | their own default | no mode known yet | reported by `strict` if they do not ask |
+
+For your own agents, declare the modes on the command:
+
+```python
+AgentCommand(("my-agent", "--acp"), "my agent", modes={"read_only": "ask", "deny_all": "ask", "custom": "ask"})
+```
+
+OpenCode has no asking mode for a custom handler: in `build` it edits without consulting anyone, and
+`strict` reports that as a violation. To have a handler consulted, make OpenCode ask in its own
+configuration (`"permission": {"edit": "ask", "bash": "ask"}` in `opencode.json`).
+
+`strict` detects a violation after the first unasked change has happened; it stops the rest and tells
+you, it cannot undo that change. Treat the policy as a contract with a cooperative agent, not as a
+sandbox. When you need a hard guarantee, run the agent where it cannot do damage: a container, a
+read-only checkout, or an AgentCore Runtime session.
+
 ## Sessions
 
 Every call returns a `session_id`. Passing it back continues the same conversation with the same
@@ -175,8 +225,8 @@ can edit and run freely inside the sandbox, and follow-up turns reuse the proces
 
 - ACP protocol version 1, which every listed agent still serves. The ACP v2 draft removes the client
   file-system and terminal methods; this client never advertised them, so the move will be small.
-- No file-system or terminal delegation: the coding agent uses its own tools in `cwd`. The tool does
-  not sandbox it beyond the permission policy.
+- No file-system or terminal delegation: the coding agent uses its own tools in `cwd`. The permission
+  policy and `strict` hold a cooperative agent to the rules; they are not a sandbox.
 - Permission requests are answered by policy or by your callable. A mode that pauses the Strands
   agent with an interrupt and asks a human is planned.
 - The agents' own authentication is not handled here; log in as you would in a terminal.
@@ -189,6 +239,19 @@ hatch run prepare   # format, lint, typecheck, tests
 ```
 
 Tests run against a scripted ACP agent in `tests/fake_acp_agent.py`, so they need no API keys.
+
+An opt-in end-to-end suite drives real agents installed on your machine. It spends model tokens and
+needs the agents logged in, so it only runs when you name them:
+
+```bash
+ACP_E2E_AGENTS=claude,opencode hatch run test tests/e2e -v -s
+```
+
+Each scenario gives the agent a small file with an obvious bug and checks five things: it can explain
+the bug without touching the file, it fixes it under `allow_all`, the edit does not happen under
+`read_only`, a custom handler is either consulted or the unasked change is reported as a violation,
+and a second task with the returned `session_id` remembers the first. Claude Code 2.1 (adapter 0.101)
+and OpenCode 1.18 pass all five.
 The `agent-client-protocol` SDK supports Python 3.10 to 3.14; if Hatch picks a newer interpreter,
 point it at a supported one with `HATCH_PYTHON=/path/to/python3.14`.
 

@@ -3,16 +3,21 @@
 Run with ``python tests/fake_acp_agent.py``. The first word of each prompt picks a script:
 
 - ``tool <kind>``: report a tool call of that kind, ask permission for it, then say whether it was allowed
+- ``sneak <kind> [seconds]``: complete a tool call of that kind without asking, then wait to see if anyone objects
 - ``slow <seconds>``: keep the turn open until cancelled or the time elapses
 - ``turn``: answer with the number of prompts seen in this session
+- ``mode``: answer with the session's current mode
 - ``usage``: answer with token usage attached
 - ``refuse``: end the turn with stop reason ``refusal``
 - ``fail``: answer with an "authentication required" error; ``error``: answer with an internal error
 - ``crash``: exit the process mid-turn
+- ``env <NAME>``: answer with the value of that environment variable, or ``<unset>``
 - anything else: echo the prompt back in two chunks
 
 Environment: ``FAKE_ACP_PROTOCOL_VERSION`` overrides the negotiated version, ``FAKE_ACP_LOAD_SESSION=1``
 advertises ``session/load`` and ``FAKE_ACP_LOADED_TURNS`` seeds the turn counter of a loaded session.
+``FAKE_ACP_MODES=a,b`` offers session modes, ``FAKE_ACP_CONFIG_MODES=a,b`` offers them as the ``mode``
+config option instead, and ``FAKE_ACP_MODE`` picks the starting one (the last listed by default).
 """
 
 from __future__ import annotations
@@ -35,6 +40,11 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PromptResponse,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
+    SessionMode,
+    SessionModeState,
+    SetSessionConfigOptionResponse,
     SetSessionModeResponse,
     TextContentBlock,
     ToolCallLocation,
@@ -52,11 +62,16 @@ OPTIONS = [
 ]
 
 
+def _listed(name: str) -> list[str]:
+    return [item for item in os.environ.get(name, "").split(",") if item]
+
+
 class FakeAgent(Agent):
     def __init__(self) -> None:
         self._conn: Client | None = None
         self._next = 0
         self._turns: dict[str, int] = {}
+        self._modes: dict[str, str] = {}
         self._cancelled: dict[str, asyncio.Event] = {}
 
     def on_connect(self, conn: Client) -> None:
@@ -83,16 +98,57 @@ class FakeAgent(Agent):
         session_id = f"fake-{os.getpid()}-{self._next}"
         self._next += 1
         self._turns[session_id] = 0
-        return NewSessionResponse(session_id=session_id)
+        return NewSessionResponse(
+            session_id=session_id, modes=self._mode_state(session_id), config_options=self._config_options(session_id)
+        )
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> LoadSessionResponse:
         self._turns[session_id] = int(os.environ.get("FAKE_ACP_LOADED_TURNS", "0"))
         # Replay a bit of history, like a real agent does; the client must not collect it.
         await self._say(session_id, "replayed history")
-        return LoadSessionResponse()
+        return LoadSessionResponse(modes=self._mode_state(session_id), config_options=self._config_options(session_id))
+
+    # ── modes, offered either the classic way or as a config option ──
+
+    def _starting_mode(self, offered: list[str]) -> str:
+        return os.environ.get("FAKE_ACP_MODE") or offered[-1]
+
+    def _mode_state(self, session_id: str) -> SessionModeState | None:
+        offered = _listed("FAKE_ACP_MODES")
+        if not offered:
+            return None
+        current = self._modes.setdefault(session_id, self._starting_mode(offered))
+        return SessionModeState(
+            current_mode_id=current, available_modes=[SessionMode(id=mode, name=mode.title()) for mode in offered]
+        )
+
+    def _config_options(self, session_id: str) -> list[SessionConfigOptionSelect] | None:
+        offered = _listed("FAKE_ACP_CONFIG_MODES")
+        if not offered:
+            return None
+        current = self._modes.setdefault(session_id, self._starting_mode(offered))
+        return [
+            SessionConfigOptionSelect(
+                id="mode",
+                name="Mode",
+                category="mode",
+                current_value=current,
+                options=[SessionConfigSelectOption(value=mode, name=mode.title()) for mode in offered],
+            )
+        ]
 
     async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> SetSessionModeResponse:
+        self._modes[session_id] = mode_id
         return SetSessionModeResponse()
+
+    async def set_config_option(
+        self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+    ) -> SetSessionConfigOptionResponse:
+        if config_id == "mode":
+            self._modes[session_id] = str(value)
+        return SetSessionConfigOptionResponse(config_options=self._config_options(session_id) or [])
+
+    # ── prompts ──
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
         text = " ".join(block.text for block in prompt if isinstance(block, TextContentBlock))
@@ -105,19 +161,15 @@ class FakeAgent(Agent):
         if command == "tool":
             kind = words[1] if len(words) > 1 else "edit"
             call_id = f"call-{self._turns[session_id]}"
+            title = f"{kind} example.txt"
             location = [ToolCallLocation(path=os.path.join(os.getcwd(), "example.txt"))]
             await self.conn.session_update(
-                session_id,
-                ToolCallStart(tool_call_id=call_id, title=f"{kind} example.txt", kind=kind, status="in_progress"),
+                session_id, ToolCallStart(tool_call_id=call_id, title=title, kind=kind, status="pending")
             )
             response = await self.conn.request_permission(
                 session_id=session_id,
                 tool_call=ToolCallUpdate(
-                    tool_call_id=call_id,
-                    title=f"{kind} example.txt",
-                    kind=kind,
-                    status="in_progress",
-                    locations=location,
+                    tool_call_id=call_id, title=title, kind=kind, status="pending", locations=location
                 ),
                 options=list(OPTIONS),
             )
@@ -128,6 +180,22 @@ class FakeAgent(Agent):
             )
             await self._say(session_id, f"permission {'allowed' if allowed else 'denied'} via {selected}")
             return PromptResponse(stop_reason="end_turn")
+
+        if command == "sneak":
+            kind = words[1] if len(words) > 1 else "edit"
+            wait = float(words[2]) if len(words) > 2 else 2.0
+            call_id = f"sneak-{self._turns[session_id]}"
+            await self.conn.session_update(
+                session_id,
+                ToolCallStart(tool_call_id=call_id, title=f"{kind} example.txt", kind=kind, status="pending"),
+            )
+            await self.conn.session_update(session_id, ToolCallProgress(tool_call_id=call_id, status="completed"))
+            try:
+                await asyncio.wait_for(cancelled.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                await self._say(session_id, "nobody stopped me")
+                return PromptResponse(stop_reason="end_turn")
+            return PromptResponse(stop_reason="cancelled")
 
         if command == "slow":
             seconds = float(words[1]) if len(words) > 1 else 5.0
@@ -141,6 +209,10 @@ class FakeAgent(Agent):
 
         if command == "turn":
             await self._say(session_id, f"turn {self._turns[session_id]}")
+            return PromptResponse(stop_reason="end_turn")
+
+        if command == "mode":
+            await self._say(session_id, f"mode {self._modes.get(session_id, 'none')}")
             return PromptResponse(stop_reason="end_turn")
 
         if command == "usage":
@@ -160,6 +232,10 @@ class FakeAgent(Agent):
 
         if command == "crash":
             os._exit(3)
+
+        if command == "env":
+            await self._say(session_id, os.environ.get(words[1], "<unset>"))
+            return PromptResponse(stop_reason="end_turn")
 
         await self.conn.session_update(session_id, AgentThoughtChunk(content=TextContentBlock(text="thinking")))
         await self._say(session_id, "You said: ")

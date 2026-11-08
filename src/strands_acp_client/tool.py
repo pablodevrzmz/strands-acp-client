@@ -12,14 +12,15 @@ from strands.types.tools import ToolContext
 
 from strands_acp_client._agents import AgentCommand, AgentsArg, resolve_agents
 from strands_acp_client._permissions import PermissionPolicy, policy_label, validate_policy
-from strands_acp_client._session import AcpAgentError, SessionRegistry, TurnResult
+from strands_acp_client._session import AcpAgentError, AcpSession, SessionRegistry, TurnResult
 
 __all__ = ["make_acp_agent"]
 
 _SUCCESS_STOP_REASONS = frozenset({"end_turn", "max_tokens", "max_turn_requests"})
 
 _POLICY_NOTES: dict[str, str] = {
-    "read_only": "the agent can read, search and fetch, but every edit, delete or command it proposes is refused",
+    "read_only": "the agent can read, search and fetch, but every edit, delete or command it proposes is refused, "
+    "and a change made without asking stops the task with an error",
     "allow_all": "every permission the agent asks for is granted, so it can edit files and run commands",
     "deny_all": "every permission the agent asks for is refused",
     "custom": "permissions are decided by a handler supplied by the application",
@@ -33,7 +34,8 @@ def make_acp_agent(
     cwd: str | os.PathLike[str] | None = None,
     timeout: float = 600.0,
     permissions: PermissionPolicy = "read_only",
-    env: Mapping[str, str] | None = None,
+    strict: bool = True,
+    env: Mapping[str, str | None] | None = None,
     keep_sessions: bool = True,
     max_sessions: int = 8,
     cancel_grace: float = 10.0,
@@ -53,7 +55,11 @@ def make_acp_agent(
         permissions: How the agent's ``session/request_permission`` calls are answered:
             ``"read_only"`` (default), ``"allow_all"``, ``"deny_all"`` or a callable that receives a
             :class:`~strands_acp_client.PermissionRequest` and returns ``True``, ``False`` or an option id.
-        env: Extra environment variables for every agent process.
+        strict: Under any policy but ``allow_all``, stop the turn and return an error when the agent
+            completes an edit, delete, move or command it never asked permission for. A policy can only
+            answer questions; this is what catches an agent that is configured not to ask.
+        env: Environment changes for every agent process, applied over this process's environment.
+            A value of ``None`` removes the variable.
         keep_sessions: Keep agent processes alive after a call so the model can continue the
             conversation with ``session_id``. ``False`` closes the process after every call.
         max_sessions: Maximum number of live sessions; the least recently used is closed first.
@@ -104,7 +110,7 @@ def make_acp_agent(
 
         try:
             session = await registry.acquire(
-                chosen, resolved[chosen], work_dir, session_id, permissions, env, cancel_grace
+                chosen, resolved[chosen], work_dir, session_id, permissions, env, cancel_grace, strict
             )
         except AcpAgentError as exc:
             yield _error(str(exc))
@@ -128,7 +134,7 @@ def make_acp_agent(
         if result is None:
             yield _error(f"agent {chosen!r} produced no result")
             return
-        yield _tool_result(chosen, session.session_id, session.resumed, session.agent_info, label, result)
+        yield _tool_result(chosen, session, label, result)
 
     decorated = tool(
         name=name, description=tool_description, inputSchema={"json": input_schema}, context="tool_context"
@@ -194,14 +200,7 @@ def _annotations(label: str) -> dict[str, Any]:
 # ── results ──
 
 
-def _tool_result(
-    agent_name: str,
-    session_id: str,
-    resumed: bool,
-    agent_info: dict[str, Any] | None,
-    label: str,
-    result: TurnResult,
-) -> dict[str, Any]:
+def _tool_result(agent_name: str, session: AcpSession, label: str, result: TurnResult) -> dict[str, Any]:
     status = "success" if result.error is None and result.stop_reason in _SUCCESS_STOP_REASONS else "error"
     text = result.text.strip()
     if result.error is not None:
@@ -214,15 +213,18 @@ def _tool_result(
         text = "The agent finished without returning any text."
     details = {
         "agent": agent_name,
-        "agent_info": agent_info,
-        "session_id": session_id,
-        "resumed": resumed,
+        "agent_info": session.agent_info,
+        "session_id": session.session_id,
+        "resumed": session.resumed,
+        "mode": session.mode,
         "stop_reason": result.stop_reason,
         "usage": result.usage,
         "tool_calls": result.tool_calls,
         "permissions": {"policy": label, "allowed": result.allowed, "denied": result.denied},
         "elapsed_seconds": round(result.elapsed, 2),
     }
+    if result.violation is not None:
+        details["policy_violation"] = result.violation
     return {"status": status, "content": [{"text": text}, {"json": details}]}
 
 
