@@ -1,9 +1,11 @@
 """End-to-end checks against real coding agents installed on this machine.
 
 These tests cost model tokens and need the agents logged in, so they never run by default.
-Select the agents with ``ACP_E2E_AGENTS`` (known names from ``KNOWN_AGENTS`` or ``name=argv``):
+Select the agents with ``ACP_E2E_AGENTS``: known names from ``KNOWN_AGENTS``, ``name+extra args`` for a
+known agent with more flags, or ``name=argv`` for any command:
 
     ACP_E2E_AGENTS=claude,opencode hatch run test tests/e2e -v -s
+    ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
 
 Each scenario works in a fresh temporary directory holding a tiny Python file with an obvious bug,
 so the agent has something concrete to read, explain and fix.
@@ -19,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from strands_acp_client import KNOWN_AGENTS, make_acp_agent
+from strands_acp_client import KNOWN_AGENTS, AgentCommand, make_acp_agent
 from tests.conftest import result_json, result_text
 
 pytestmark = pytest.mark.e2e
@@ -32,17 +34,21 @@ CALC = textwrap.dedent(
 )
 
 
-def _selected_agents() -> dict[str, tuple[str, ...]]:
+def _selected_agents() -> dict[str, AgentCommand]:
     raw = os.environ.get("ACP_E2E_AGENTS", "").strip()
     if not raw:
         return {}
-    agents: dict[str, tuple[str, ...]] = {}
+    agents: dict[str, AgentCommand] = {}
     for item in raw.split(","):
         item = item.strip()
         if not item:
             continue
-        name, _, argv = item.partition("=")
-        agents[name] = tuple(shlex.split(argv)) if argv else KNOWN_AGENTS[name].argv
+        if "=" in item.split("+", 1)[0]:
+            name, _, argv = item.partition("=")
+            agents[name] = AgentCommand(tuple(shlex.split(argv)))
+        else:
+            name, _, extra = item.partition("+")
+            agents[name] = KNOWN_AGENTS[name].with_args(*shlex.split(extra))
     return agents
 
 

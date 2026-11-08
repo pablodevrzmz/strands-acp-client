@@ -72,6 +72,9 @@ The model sees one tool, `acp_agent`, with these inputs:
 | `session_id` | A `session_id` from an earlier result, to continue that conversation. |
 | `cwd` | Working directory for this call. Defaults to the factory's `cwd`. |
 
+Every task is sent together with the absolute working directory, so relative paths in the task
+resolve even for an agent whose model cannot run `pwd`.
+
 Each result carries the agent's final message as text plus a JSON block with `session_id`,
 `stop_reason`, token `usage` (when the agent reports it), the `tool_calls` it made (id, title,
 ACP kind, status, file locations), how many permission requests were allowed or denied, and the
@@ -110,6 +113,19 @@ acp_agent = make_acp_agent(
 
 The description you give each agent is shown to the model, so say what each one is for.
 
+To add flags to a known agent, for example to choose its model, extend it instead of rewriting the
+command, so it keeps what the package knows about it:
+
+```python
+from strands_acp_client import KNOWN_AGENTS, make_acp_agent
+
+local_strands = KNOWN_AGENTS["strands"].with_args("--model", "ollama/qwen3.8:27b", "--memory", "off")
+acp_agent = make_acp_agent(agents={"strands": local_strands})
+```
+
+That last example costs nothing to run: the Strands CLI serves a Strands agent over ACP on a local
+Ollama model, and another Strands agent delegates to it.
+
 ## Permissions
 
 Under ACP the client owns permissions: when the coding agent wants to do something its own rules
@@ -146,9 +162,10 @@ agent, and many start in a mode that does not: Claude Code often starts in `auto
 Tested against the real agents, both edited a file under `read_only` without sending a single
 permission request. So the tool does two more things under every policy except `allow_all`:
 
-1. **It puts the agent in its asking mode.** Each known agent declares, per policy, the session mode in
-   which it defers to the client, and the tool selects it through ACP (`session/set_mode` or the `mode`
-   config option) when the agent offers it. The mode in use is reported as `mode` in the result.
+1. **It puts the agent in a mode that respects the policy.** Each known agent declares, per policy,
+   either the session mode in which it defers to the client, selected through ACP (`session/set_mode`
+   or the `mode` config option) and reported as `mode` in the result, or the launch arguments that
+   restrict what it can do.
 2. **It checks that the agent asked** (`strict=True`, the default). If an edit, delete, move or command
    completes without a permission request, the turn is cancelled at once and the tool returns an error
    with `stop_reason: "policy_violation"` naming the call, instead of a success that hides it.
@@ -157,17 +174,20 @@ permission request. So the tool does two more things under every policy except `
 | --- | --- | --- | --- |
 | `claude` | your Claude Code settings, often `auto` | switched to `default` ("always ask before making changes") | the agent asks, the policy refuses |
 | `opencode` | `build` | switched to `plan` for `read_only` and `deny_all` | the agent declines on its own |
-| others | their own default | no mode known yet | reported by `strict` if they do not ask |
+| `strands` | every built-in tool, nobody asked | started with `--builtin-tools read,web_fetch` for `read_only` and `deny_all` | the agent has no tool to edit with |
+| others | their own default | nothing known yet | reported by `strict` if they do not ask |
 
-For your own agents, declare the modes on the command:
+For your own agents, declare the modes or the arguments on the command:
 
 ```python
 AgentCommand(("my-agent", "--acp"), "my agent", modes={"read_only": "ask", "deny_all": "ask", "custom": "ask"})
+AgentCommand(("my-agent", "--acp"), "my agent", policy_args={"read_only": ("--no-write",)})
 ```
 
-OpenCode has no asking mode for a custom handler: in `build` it edits without consulting anyone, and
-`strict` reports that as a violation. To have a handler consulted, make OpenCode ask in its own
-configuration (`"permission": {"edit": "ask", "bash": "ask"}` in `opencode.json`).
+OpenCode and the Strands CLI (0.2.x) have no way to consult a custom handler: OpenCode's `build` mode
+and the Strands CLI's stock tools act without asking, and `strict` reports that as a violation. For
+OpenCode, make it ask in its own configuration (`"permission": {"edit": "ask", "bash": "ask"}` in
+`opencode.json`). For the Strands CLI, give the agent only the tools the task needs.
 
 `strict` detects a violation after the first unasked change has happened; it stops the rest and tells
 you, it cannot undo that change. Treat the policy as a contract with a cooperative agent, not as a
@@ -250,8 +270,13 @@ ACP_E2E_AGENTS=claude,opencode hatch run test tests/e2e -v -s
 Each scenario gives the agent a small file with an obvious bug and checks five things: it can explain
 the bug without touching the file, it fixes it under `allow_all`, the edit does not happen under
 `read_only`, a custom handler is either consulted or the unasked change is reported as a violation,
-and a second task with the returned `session_id` remembers the first. Claude Code 2.1 (adapter 0.101)
-and OpenCode 1.18 pass all five.
+and a second task with the returned `session_id` remembers the first. Claude Code 2.1 (adapter 0.101),
+OpenCode 1.18 and the Strands CLI 0.2.4 on a local Ollama model pass all five. The last one needs no
+account and no key:
+
+```bash
+ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
+```
 The `agent-client-protocol` SDK supports Python 3.10 to 3.14; if Hatch picks a newer interpreter,
 point it at a supported one with `HATCH_PYTHON=/path/to/python3.14`.
 

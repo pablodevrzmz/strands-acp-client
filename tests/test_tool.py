@@ -368,3 +368,46 @@ def test_known_agents_carry_their_asking_modes():
     assert pinned["claude"].modes == {"read_only": "default", "deny_all": "default", "custom": "default"}
     assert resolve_agents(["opencode"])["opencode"].modes == {"read_only": "plan", "deny_all": "plan"}
     assert resolve_agents({"mine": ["my-agent"]})["mine"].modes is None
+
+
+async def test_policy_args_are_appended_for_that_policy_only(make_tool, run_tool):
+    command = AgentCommand(FAKE_ARGV, "fake", policy_args={"read_only": ("--tools", "read")})
+    _, restricted = await run_tool(make_tool(agents={"fake": command}), task="argv")
+    assert result_text(restricted) == "--tools read"
+    _, free = await run_tool(make_tool(agents={"fake": command}, permissions="allow_all"), task="argv")
+    assert result_text(free) == "<none>"
+
+
+async def test_with_args_adds_flags_and_keeps_what_is_known(make_tool, run_tool):
+    command = AgentCommand(
+        FAKE_ARGV, "fake", modes={"read_only": "ask"}, policy_args={"read_only": ("--tools", "read")}
+    )
+    pinned = command.with_args("--model", "local/tiny", "")
+    assert pinned.argv == (*FAKE_ARGV, "--model", "local/tiny", "")
+    assert pinned.modes == command.modes and pinned.policy_args == command.policy_args
+    _, result = await run_tool(make_tool(agents={"fake": pinned}), task="argv")
+    assert result_text(result).startswith("--model local/tiny")
+    assert result_text(result).endswith("--tools read")
+
+
+def test_strands_is_started_read_only_under_restrictive_policies():
+    from strands_acp_client._agents import resolve_agents
+
+    strands = KNOWN_AGENTS["strands"]
+    assert strands.argv_for("allow_all") == strands.argv
+    assert strands.argv_for("read_only")[-2:] == ("--builtin-tools", "read,web_fetch")
+    assert strands.argv_for("deny_all")[-2:] == ("--builtin-tools", "read,web_fetch")
+    # A hand-written argv under the same name does not inherit flags written for the stock command.
+    assert resolve_agents({"strands": ["strands", "--acp-server", "--agent", "./mine"]})["strands"].policy_args is None
+    with pytest.raises(ValueError):
+        AgentCommand(("",))
+
+
+async def test_every_task_tells_the_agent_its_working_directory(make_tool, run_tool, tmp_path):
+    built = make_tool()
+    _, default = await run_tool(built, task="note")
+    assert result_text(default) == f"Working directory: {os.path.abspath(tmp_path)}"
+    other = tmp_path / "nested"
+    other.mkdir()
+    _, elsewhere = await run_tool(built, task="note", cwd=str(other))
+    assert result_text(elsewhere) == f"Working directory: {os.path.abspath(other)}"

@@ -12,6 +12,8 @@ Run with ``python tests/fake_acp_agent.py``. The first word of each prompt picks
 - ``fail``: answer with an "authentication required" error; ``error``: answer with an internal error
 - ``crash``: exit the process mid-turn
 - ``env <NAME>``: answer with the value of that environment variable, or ``<unset>``
+- ``argv``: answer with the arguments the agent was started with
+- ``note``: answer with whatever came after the task in the prompt (the client adds the working directory)
 - anything else: echo the prompt back in two chunks
 
 Environment: ``FAKE_ACP_PROTOCOL_VERSION`` overrides the negotiated version, ``FAKE_ACP_LOAD_SESSION=1``
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from typing import Any
 
 from acp import PROTOCOL_VERSION, Agent, RequestError, run_agent
@@ -151,7 +154,9 @@ class FakeAgent(Agent):
     # ── prompts ──
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
-        text = " ".join(block.text for block in prompt if isinstance(block, TextContentBlock))
+        blocks = [block.text for block in prompt if isinstance(block, TextContentBlock)]
+        text = blocks[0] if blocks else ""
+        notes = blocks[1:]
         self._turns[session_id] = self._turns.get(session_id, 0) + 1
         cancelled = asyncio.Event()
         self._cancelled[session_id] = cancelled
@@ -232,6 +237,14 @@ class FakeAgent(Agent):
 
         if command == "crash":
             os._exit(3)
+
+        if command == "note":
+            await self._say(session_id, " | ".join(notes) or "<none>")
+            return PromptResponse(stop_reason="end_turn")
+
+        if command == "argv":
+            await self._say(session_id, " ".join(sys.argv[1:]) or "<none>")
+            return PromptResponse(stop_reason="end_turn")
 
         if command == "env":
             await self._say(session_id, os.environ.get(words[1], "<unset>"))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 __all__ = ["KNOWN_AGENTS", "AgentCommand", "resolve_agents"]
 
@@ -22,23 +22,42 @@ class AgentCommand:
             and many agents start in a mode that does not ask. This names the mode in which the agent
             defers to the client, e.g. ``{"read_only": "default"}`` for Claude Code. It is applied when
             the agent offers that mode, through ``session/set_mode`` or the ``mode`` config option.
+        policy_args: Extra arguments appended to ``argv`` for a permission policy, keyed the same way.
+            For agents whose restricted behaviour is chosen at launch rather than per session, e.g.
+            ``{"read_only": ("--builtin-tools", "read,web_fetch")}`` for the Strands CLI.
     """
 
     argv: tuple[str, ...]
     description: str = ""
     env: Mapping[str, str | None] | None = None
     modes: Mapping[str, str] | None = None
+    policy_args: Mapping[str, Sequence[str]] | None = None
 
     def __post_init__(self) -> None:
-        if not self.argv or not all(isinstance(part, str) and part for part in self.argv):
-            raise ValueError("argv must be a non-empty sequence of non-empty strings")
+        if not self.argv or not self.argv[0] or not all(isinstance(part, str) for part in self.argv):
+            raise ValueError("argv must be a non-empty sequence of strings starting with the program to run")
+
+    def with_args(self, *args: str) -> AgentCommand:
+        """A copy of this command with more arguments, keeping its description, modes and policy arguments.
+
+        ``KNOWN_AGENTS["strands"].with_args("--model", "ollama/qwen3.8:27b")`` pins a model without
+        losing what the package knows about the agent.
+        """
+        return replace(self, argv=(*self.argv, *args))
+
+    def argv_for(self, policy: str) -> tuple[str, ...]:
+        """The full command line for a permission policy."""
+        return (*self.argv, *(self.policy_args or {}).get(policy, ()))
 
 
 # Modes verified against the agents themselves. Claude Code's "default" is "always ask before
 # making changes"; it starts in whatever the user's settings say, often "auto". OpenCode's
-# "plan" is its read-only agent; it starts in "build", which edits without asking.
+# "plan" is its read-only agent; it starts in "build", which edits without asking. The Strands
+# CLI has no way to ask the client over ACP (0.2.x), so read-only is a matter of which built-in
+# tools it is started with.
 _ASK_FIRST = {"read_only": "default", "deny_all": "default", "custom": "default"}
 _PLAN_ONLY = {"read_only": "plan", "deny_all": "plan"}
+_READ_TOOLS = ("--builtin-tools", "read,web_fetch")
 
 KNOWN_AGENTS: dict[str, AgentCommand] = {
     "claude": AgentCommand(
@@ -62,6 +81,7 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
     "strands": AgentCommand(
         ("npx", "-y", "@strands-agents/cli", "--acp-server"),
         "A Strands agent served over ACP by the Strands CLI",
+        policy_args={"read_only": _READ_TOOLS, "deny_all": _READ_TOOLS},
     ),
 }
 """Launch commands taken from the ACP registry (https://github.com/agentclientprotocol/registry)."""
@@ -76,7 +96,8 @@ def resolve_agents(agents: AgentsArg) -> dict[str, AgentCommand]:
     Accepts a mapping of name to argv / :class:`AgentCommand` / known-agent alias, a list of
     known-agent names, a single known-agent name, or ``None`` (Claude Code only). A plain argv
     given under a known name keeps that agent's description and modes, so pinning a version
-    does not lose them.
+    does not lose them; its policy arguments are not carried over, because they are written for
+    the stock command. To add flags to a known agent, use :meth:`AgentCommand.with_args`.
     """
     if agents is None:
         return {"claude": KNOWN_AGENTS["claude"]}

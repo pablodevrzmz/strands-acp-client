@@ -102,7 +102,7 @@ class AcpSession:
         stack = AsyncExitStack()
         try:
             self._conn, self._proc = await stack.enter_async_context(
-                spawn_agent_process(self.client, *self.command.argv, cwd=self.cwd, env=env)
+                spawn_agent_process(self.client, *self.command.argv_for(self.policy_label), cwd=self.cwd, env=env)
             )
         except FileNotFoundError:
             await stack.aclose()
@@ -217,9 +217,11 @@ class AcpSession:
             loop = asyncio.get_running_loop()
             started = loop.time()
             deadline = started + timeout
-            task = asyncio.ensure_future(
-                self._conn.prompt(session_id=self.session_id, prompt=[TextContentBlock(text=text)])
-            )
+            # The agent knows its working directory from session/new, but its model often does not:
+            # one that cannot run ``pwd`` (a read-only toolset) has no way to turn the relative paths
+            # in a task into the absolute ones its file tools want. So every task says where it is.
+            blocks = [TextContentBlock(text=text), TextContentBlock(text=f"Working directory: {self.cwd}")]
+            task = asyncio.ensure_future(self._conn.prompt(session_id=self.session_id, prompt=blocks))
             cancel_reason: str | None = None
             try:
                 while not task.done():
