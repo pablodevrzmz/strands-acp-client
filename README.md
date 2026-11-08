@@ -1,0 +1,73 @@
+<div align="center">
+  <div>
+    <a href="https://strandsagents.com">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://strandsagents.com/latest/assets/wordmark-github-dark.svg">
+        <img src="https://strandsagents.com/latest/assets/wordmark-github-light.svg" alt="Strands" width="320">
+      </picture>
+    </a>
+  </div>
+  <h1>Strands Agents Extension Template</h1>
+  <h2>Build and publish custom components for Strands Agents.</h2>
+  <p>
+    <a href="https://strandsagents.com/">Documentation</a> ◆
+    <a href="https://github.com/strands-agents/samples">Samples</a> ◆
+    <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-cli">CLI</a> ◆
+    <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-mcp">MCP Server</a>
+    <br>
+    Harness (<a href="https://github.com/strands-agents/harness-sdk/tree/main/harness-py">Python</a>, <a href="https://github.com/strands-agents/harness-sdk/tree/main/harness-ts">TypeScript</a>) ◆
+    SDK (<a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-py">Python</a>, <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-ts">TypeScript</a>) ◆
+    <a href="https://github.com/strands-agents/box">Box</a> ◆
+    <a href="https://github.com/strands-agents/shell">Shell</a> ◆
+    <a href="https://github.com/strands-agents/evals">Evals</a> ◆
+    <a href="https://github.com/strands-labs">Labs</a>
+  </p>
+</div>
+
+This monorepo contains starter templates for building custom Strands Agents extensions in two languages. Each template gives you skeletons for the major extension points, an interactive setup script that customizes the project for your package, and CI/publish workflows wired up to PyPI or npm.
+
+| Language   | Directory                  | Package registry | SDK                                                      |
+|------------|----------------------------|------------------|----------------------------------------------------------|
+| Python     | [`python/`](./python)      | PyPI             | [`strands-agents`](https://pypi.org/project/strands-agents/) |
+| TypeScript | [`typescript/`](./typescript) | npm           | [`@strands-agents/sdk`](https://www.npmjs.com/package/@strands-agents/sdk) |
+
+## Getting started
+
+1. Click **Use this template** on GitHub to create your own repository.
+2. Clone it locally and decide which language you're targeting.
+3. Open the corresponding subdirectory and follow its README:
+   - Python → [`python/README.md`](./python/README.md)
+   - TypeScript → [`typescript/README.md`](./typescript/README.md)
+
+You can keep both subprojects in the same repo if your package ships SDKs in both languages, or delete the directory you don't need.
+
+## What's in each template
+
+Both templates expose the same seven Strands extension points so you can pick whichever fits your use case:
+
+| Component            | Purpose                                                |
+|----------------------|--------------------------------------------------------|
+| Tool                 | Add capabilities to agents using the `tool` primitive  |
+| Model provider       | Integrate custom LLM APIs                              |
+| Plugin               | Bundle hooks and tools into a composable package       |
+| Intervention         | Add composable control handlers for authorization, guardrails, and steering |
+| Conversation manager | Control context window and message history            |
+| Memory store         | Give agents cross-session knowledge via a search backend |
+| Storage              | Persist sessions, offloaded context, and other data under string keys |
+
+The interactive setup script in each subdirectory removes the components you don't select, renames everything to your package name, and wires up `pyproject.toml` / `package.json` accordingly.
+
+## Releases and tags
+
+Releases are scoped per language so the two halves of this monorepo can ship independently:
+
+| Tag prefix    | Workflow                                        | Publishes to |
+|---------------|-------------------------------------------------|--------------|
+| `python-v*`   | [`publish-python.yml`](.github/workflows/publish-python.yml)         | PyPI         |
+| `typescript-v*` | [`publish-typescript.yml`](.github/workflows/publish-typescript.yml) | npm          |
+
+When the setup script hoists your chosen language to the repo root, it drops the dual-prefix scheme automatically — generated repos use the standard `v*` tag form.
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE) for details.
