@@ -60,6 +60,7 @@ class Turn:
         self.tool_calls: dict[str, dict[str, Any]] = {}
         self.allowed = 0
         self.denied = 0
+        self.refused: list[str] = []
         self.asked: set[str] = set()
         self.violation: dict[str, Any] | None = None
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -180,6 +181,7 @@ class StrandsAcpClient(Client):
                 turn.allowed += 1
             else:
                 turn.denied += 1
+                turn.refused.append(request.title or request.kind or "a tool call")
             turn.push(
                 {
                     "type": "permission",

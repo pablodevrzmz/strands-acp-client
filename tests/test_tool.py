@@ -40,7 +40,7 @@ def test_agents_argument_shapes(tmp_path):
     custom = make_acp_agent(agents={"mine": AgentCommand(("my-agent", "--acp"), "my agent")}, cwd=tmp_path)
     assert "mine (my agent)" in custom.tool_spec["description"]
     # Presets exist only for agents the end-to-end suite has driven for real.
-    assert set(KNOWN_AGENTS) == {"claude", "opencode", "strands"}
+    assert set(KNOWN_AGENTS) == {"claude", "opencode", "qwen", "strands"}
     with pytest.raises(ValueError, match="Pass argv explicitly"):
         make_acp_agent(agents=["gemini"], cwd=tmp_path)
     unverified = make_acp_agent(agents={"gemini": ["npx", "-y", "@google/gemini-cli", "--acp"]}, cwd=tmp_path)
@@ -92,8 +92,11 @@ async def test_read_only_allows_reads_and_refuses_edits(make_tool, run_tool):
 
     _, edit = await run_tool(built, task="tool edit")
     assert "permission denied via reject-once" in result_text(edit)
+    assert result_text(edit).endswith("Refused under the read_only policy: edit example.txt.")
     details = result_json(edit)
     assert details["permissions"]["denied"] == 1
+    assert details["refused"] == ["edit example.txt"]
+    assert "refused" not in result_json(read)
     assert details["tool_calls"] == [
         {"id": "call-1", "title": "edit example.txt", "kind": "edit", "status": "failed", "locations": []}
     ]
@@ -372,6 +375,7 @@ def test_known_agents_carry_their_asking_modes():
     pinned = resolve_agents({"claude": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.101.0"]})
     assert pinned["claude"].modes == {"read_only": "default", "deny_all": "default", "custom": "default"}
     assert resolve_agents(["opencode"])["opencode"].modes == {"read_only": "plan", "deny_all": "plan"}
+    assert resolve_agents(["qwen"])["qwen"].modes == pinned["claude"].modes
     assert resolve_agents({"mine": ["my-agent"]})["mine"].modes is None
 
 
@@ -416,3 +420,27 @@ async def test_every_task_tells_the_agent_its_working_directory(make_tool, run_t
     other.mkdir()
     _, elsewhere = await run_tool(built, task="note", cwd=str(other))
     assert result_text(elsewhere) == f"Working directory: {os.path.abspath(other)}"
+
+
+def test_vendor_notifications_do_not_log_errors(caplog):
+    import logging
+
+    from acp import RequestError
+
+    from strands_acp_client._session import _quiet_vendor_notifications
+
+    _quiet_vendor_notifications()
+    _quiet_vendor_notifications()  # installing twice must not stack filters
+    root = logging.getLogger()
+    assert sum(type(f).__name__ == "_VendorNotificationFilter" for f in root.filters) == 1
+
+    message = "Unhandled error while handling notification method=%s"
+    with caplog.at_level(logging.DEBUG):
+        root.error(message, "qwen/notify/session/mode-update", exc_info=RequestError.method_not_found("x"))
+        root.error(message, "session/update", exc_info=ValueError("a real bug in a handler"))
+        root.error("something else went wrong")
+    errors = [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR]
+    assert errors == [
+        "Unhandled error while handling notification method=session/update",
+        "something else went wrong",
+    ]
