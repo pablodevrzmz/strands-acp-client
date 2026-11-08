@@ -6,7 +6,8 @@
 
 Use coding agents as tools from a [Strands Agents](https://strandsagents.com) agent, over the
 [Agent Client Protocol](https://agentclientprotocol.com) (ACP). Verified end to end with Claude Code,
-OpenCode and a Strands agent served by the Strands CLI; any other ACP agent plugs in by its command.
+OpenCode, Qwen Code and a Strands agent served by the Strands CLI; any other ACP agent plugs in by its
+command.
 Your agent delegates a task, the coding agent works in a directory with its own tools, and the final
 answer comes back as a tool result together with a `session_id` for follow-ups.
 
@@ -78,7 +79,8 @@ resolve even for an agent whose model cannot run `pwd`.
 Each result carries the agent's final message as text plus a JSON block with `session_id`,
 `stop_reason`, token `usage` (when the agent reports it), the `tool_calls` it made (id, title,
 ACP kind, status, file locations), how many permission requests were allowed or denied, and the
-elapsed time.
+elapsed time. When requests were refused, the text ends with a line naming them, because an agent
+does not always say that it was turned down.
 
 ## Agents
 
@@ -90,6 +92,7 @@ list is short on purpose:
 | --- | --- | --- |
 | `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Claude Code 2.1, adapter 0.101 |
 | `opencode` | `opencode acp` | OpenCode 1.18 |
+| `qwen` | `npx -y @qwen-code/qwen-code --acp` | Qwen Code 0.27 on a local Ollama model |
 | `strands` | `npx -y @strands-agents/cli --acp-server` | Strands CLI 0.2.4 on a local Ollama model |
 
 Anything else that speaks ACP on stdin/stdout works by passing its command; the
@@ -123,7 +126,17 @@ acp_agent = make_acp_agent(agents={"strands": local_strands})
 ```
 
 That last example costs nothing to run: the Strands CLI serves a Strands agent over ACP on a local
-Ollama model, and another Strands agent delegates to it.
+Ollama model, and another Strands agent delegates to it. Qwen Code runs on the same local model
+through Ollama's OpenAI-compatible endpoint:
+
+```python
+local_qwen = KNOWN_AGENTS["qwen"].with_args(
+    "--auth-type", "openai",
+    "--openai-base-url", "http://localhost:11434/v1",
+    "--openai-api-key", "ollama",
+    "-m", "qwen3.8:27b",
+)
+```
 
 ## Permissions
 
@@ -172,6 +185,7 @@ permission request. So the tool does two more things under every policy except `
 | Agent | Starts in | Under a restrictive policy | An edit under `read_only` |
 | --- | --- | --- | --- |
 | `claude` | your Claude Code settings, often `auto` | switched to `default` ("always ask before making changes") | the agent asks, the policy refuses |
+| `qwen` | `auto`, where a classifier decides | switched to `default` | the agent asks, the policy refuses |
 | `opencode` | `build` | switched to `plan` for `read_only` and `deny_all` | the agent declines on its own |
 | `strands` | every built-in tool, nobody asked | started with `--builtin-tools read,web_fetch` for `read_only` and `deny_all` | the agent has no tool to edit with |
 | others | their own default | nothing known yet | reported by `strict` if they do not ask |
@@ -270,8 +284,8 @@ Each scenario gives the agent a small file with an obvious bug and checks five t
 the bug without touching the file, it fixes it under `allow_all`, the edit does not happen under
 `read_only`, a custom handler is either consulted or the unasked change is reported as a violation,
 and a second task with the returned `session_id` remembers the first. Claude Code 2.1 (adapter 0.101),
-OpenCode 1.18 and the Strands CLI 0.2.4 on a local Ollama model pass all five. The last one needs no
-account and no key:
+OpenCode 1.18, and Qwen Code 0.27 and the Strands CLI 0.2.4 on a local Ollama model pass all five. The
+last two need no account and no key:
 
 ```bash
 ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s

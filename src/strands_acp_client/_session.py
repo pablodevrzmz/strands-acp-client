@@ -32,6 +32,36 @@ except PackageNotFoundError:  # pragma: no cover - source checkout without metad
 _CLIENT_INFO = Implementation(name="strands-acp-client", title="Strands ACP client tool", version=_VERSION)
 
 
+class _VendorNotificationFilter(logging.Filter):
+    """Drop the SDK's error record for a notification this client has no handler for.
+
+    Agents send notifications of their own outside the ACP namespace (Qwen Code emits
+    ``qwen/notify/session/mode-update``). ACP lets a receiver ignore unknown notifications, but
+    the Python SDK logs each one on the root logger as "Unhandled error while handling
+    notification" with a traceback. That is noise in an application's log, so it is turned
+    into a debug line here; every other record passes untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not str(record.msg).startswith("Unhandled error while handling notification"):
+            return True
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, RequestError) and exc.code == -32601:
+            method = record.args[0] if isinstance(record.args, tuple) and record.args else ""
+            logger.debug("ignored vendor notification %s", method)
+            return False
+        return True
+
+
+_vendor_filter = _VendorNotificationFilter()
+
+
+def _quiet_vendor_notifications() -> None:
+    root = logging.getLogger()
+    if _vendor_filter not in root.filters:
+        root.addFilter(_vendor_filter)
+
+
 class AcpAgentError(Exception):
     """The agent could not be started, resumed or driven through a turn."""
 
@@ -50,6 +80,7 @@ class TurnResult:
     elapsed: float
     error: str | None = None
     violation: dict[str, Any] | None = None
+    refused: tuple[str, ...] = ()
 
 
 class AcpSession:
@@ -89,6 +120,7 @@ class AcpSession:
 
     async def start(self, session_id: str | None = None) -> None:
         """Spawn the agent, negotiate ACP v1 and open (or resume) a session."""
+        _quiet_vendor_notifications()
         self.loop = asyncio.get_running_loop()
         self._lock = asyncio.Lock()
         env = dict(os.environ)
@@ -314,6 +346,7 @@ class AcpSession:
             elapsed=elapsed,
             error=error,
             violation=turn.violation,
+            refused=tuple(turn.refused),
         )
 
 

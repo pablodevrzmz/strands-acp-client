@@ -211,7 +211,12 @@ def _tool_result(agent_name: str, session: AcpSession, label: str, result: TurnR
         text = f"The agent stopped early ({result.stop_reason})." + (f"\n\n{text}" if text else "")
     elif not text:
         text = "The agent finished without returning any text."
-    details = {
+    if result.refused:
+        # Agents do not always say that they were refused; the caller needs to know either way.
+        shown = "; ".join(result.refused[:5])
+        more = f"; and {len(result.refused) - 5} more" if len(result.refused) > 5 else ""
+        text += f"\n\nRefused under the {label} policy: {shown}{more}."
+    details: dict[str, Any] = {
         "agent": agent_name,
         "agent_info": session.agent_info,
         "session_id": session.session_id,
@@ -223,6 +228,8 @@ def _tool_result(agent_name: str, session: AcpSession, label: str, result: TurnR
         "permissions": {"policy": label, "allowed": result.allowed, "denied": result.denied},
         "elapsed_seconds": round(result.elapsed, 2),
     }
+    if result.refused:
+        details["refused"] = list(result.refused)
     if result.violation is not None:
         details["policy_violation"] = result.violation
     return {"status": status, "content": [{"text": text}, {"json": details}]}

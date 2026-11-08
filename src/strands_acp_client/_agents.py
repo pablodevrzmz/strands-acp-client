@@ -51,7 +51,8 @@ class AgentCommand:
 
 
 # Modes verified against the agents themselves. Claude Code's "default" is "always ask before
-# making changes"; it starts in whatever the user's settings say, often "auto". OpenCode's
+# making changes"; it starts in whatever the user's settings say, often "auto". Qwen Code is the
+# same story: it starts in "auto", where a classifier decides, and asks in "default". OpenCode's
 # "plan" is its read-only agent; it starts in "build", which edits without asking. The Strands
 # CLI has no way to ask the client over ACP (0.2.x), so read-only is a matter of which built-in
 # tools it is started with.
@@ -63,6 +64,11 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
     "claude": AgentCommand(
         ("npx", "-y", "@agentclientprotocol/claude-agent-acp"),
         "Claude Code through the official ACP adapter",
+        modes=_ASK_FIRST,
+    ),
+    "qwen": AgentCommand(
+        ("npx", "-y", "@qwen-code/qwen-code", "--acp"),
+        "Qwen Code",
         modes=_ASK_FIRST,
     ),
     "opencode": AgentCommand(
