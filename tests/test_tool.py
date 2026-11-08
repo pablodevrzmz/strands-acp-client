@@ -444,3 +444,12 @@ def test_vendor_notifications_do_not_log_errors(caplog):
         "Unhandled error while handling notification method=session/update",
         "something else went wrong",
     ]
+
+
+def test_refused_calls_are_named_with_their_kind():
+    from strands_acp_client._client import _describe_call
+
+    assert _describe_call("calc.py", "edit") == "calc.py (edit)"
+    assert _describe_call("Edit calc.py", "edit") == "Edit calc.py"
+    assert _describe_call(None, "execute") == "execute"
+    assert _describe_call(None, None) == "a tool call"

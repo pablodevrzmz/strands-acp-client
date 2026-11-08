@@ -181,7 +181,7 @@ class StrandsAcpClient(Client):
                 turn.allowed += 1
             else:
                 turn.denied += 1
-                turn.refused.append(request.title or request.kind or "a tool call")
+                turn.refused.append(_describe_call(request.title, request.kind))
             turn.push(
                 {
                     "type": "permission",
@@ -261,6 +261,15 @@ class StrandsAcpClient(Client):
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         return None
+
+
+def _describe_call(title: str | None, kind: str | None) -> str:
+    """Name a tool call for the caller: its title, plus its kind when the title does not say it."""
+    if not title:
+        return kind or "a tool call"
+    if not kind or kind in title.lower():
+        return title
+    return f"{title} ({kind})"
 
 
 def _selected_kind(response: RequestPermissionResponse, options: list[PermissionOption]) -> str | None:
