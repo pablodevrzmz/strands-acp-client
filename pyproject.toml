@@ -12,7 +12,7 @@ license = {text = "Apache-2.0"}
 authors = [
     {name = "Jose Pablo Ramírez Méndez", email = "pablo.dev.rz.mz@gmail.com"}
 ]
-keywords = ["strands", "agents", "ai", "tool"]
+keywords = ["strands", "agents", "ai", "tool", "acp", "agent-client-protocol", "coding-agents", "claude-code", "codex"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -22,10 +22,13 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 dependencies = [
     "strands-agents>=1.0.0",
+    "agent-client-protocol>=1.0.0rc3,<2",
     "pydantic>=2.0.0",
 ]
 
@@ -87,3 +90,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+filterwarnings = [
+    # pytest-asyncio still touches the event loop policy; Python 3.14 deprecates it.
+    "ignore:.*event_loop_policy.*:DeprecationWarning",
+]

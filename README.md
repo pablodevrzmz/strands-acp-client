@@ -1,200 +1,197 @@
-<div align="center">
-  <div>
-    <a href="https://strandsagents.com">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="https://strandsagents.com/latest/assets/wordmark-github-dark.svg">
-        <img src="https://strandsagents.com/latest/assets/wordmark-github-light.svg" alt="Strands" width="320">
-      </picture>
-    </a>
-  </div>
-  <h1>Strands Agents Extension Template — Python</h1>
-  <h2>Build and publish custom Python components for Strands Agents.</h2>
-  <p>
-    <a href="https://strandsagents.com/">Documentation</a> ◆
-    <a href="https://github.com/strands-agents/samples">Samples</a> ◆
-    <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-cli">CLI</a> ◆
-    <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-mcp">MCP Server</a>
-    <br>
-    Harness (<a href="https://github.com/strands-agents/harness-sdk/tree/main/harness-py">Python</a>, <a href="https://github.com/strands-agents/harness-sdk/tree/main/harness-ts">TypeScript</a>) ◆
-    SDK (<a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-py">Python</a>, <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-ts">TypeScript</a>) ◆
-    <a href="https://github.com/strands-agents/box">Box</a> ◆
-    <a href="https://github.com/strands-agents/shell">Shell</a> ◆
-    <a href="https://github.com/strands-agents/evals">Evals</a> ◆
-    <a href="https://github.com/strands-labs">Labs</a>
-  </p>
-</div>
+# strands-acp-client
 
-This template helps you build and publish custom components for [Strands Agents](https://github.com/strands-agents/harness-sdk/tree/main/strands-py). Whether you're creating a new tool, model provider, or storage backend, this directory gives you a starting point with the right structure and conventions.
+[![PyPI](https://img.shields.io/pypi/v/strands-acp-client.svg)](https://pypi.org/project/strands-acp-client/)
+[![CI](https://github.com/pablodevrzmz/strands-acp-client/actions/workflows/ci.yml/badge.svg)](https://github.com/pablodevrzmz/strands-acp-client/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
+Use coding agents as tools from a [Strands Agents](https://strandsagents.com) agent, over the
+[Agent Client Protocol](https://agentclientprotocol.com) (ACP): Claude Code, Codex, Gemini CLI,
+GitHub Copilot CLI, Kiro CLI, OpenCode, Qwen Code, a Strands agent served by the Strands CLI, or any
+other ACP agent. Your agent delegates a task, the coding agent works in a directory with its own
+tools, and the final answer comes back as a tool result together with a `session_id` for follow-ups.
 
-## Getting started
+ACP has two halves. The *Agent* half exposes an agent to editors like Zed; for Strands that already
+exists as [strands-acp](https://github.com/ryancormack/strands-acp) (TypeScript). This package is the
+*Client* half: the Strands agent takes the editor's seat, launches the coding agent, hands it the
+task and decides its permission requests.
 
-### 1. Create your repository
-
-Click "Use this template" on GitHub to create your own repository. Then clone it locally and switch into this directory:
+## Install
 
 ```bash
-git clone https://github.com/pablodevrzmz/your-repo-name
-cd your-repo-name
+pip install strands-acp-client
 ```
 
-### 2. Install dependencies
+The agents themselves are separate programs. Most official adapters run through `npx`, so Node.js 20+
+must be on `PATH`, and each agent needs its own login or API key exactly as it does in a terminal
+(for example `claude login` for Claude Code, `codex login` for Codex). Kiro CLI and OpenCode ship as
+binaries you install first.
+
+For unattended runs, give the agent a credential that does not depend on an interactive login. Claude Code
+issues long-lived tokens with `claude setup-token`; pass one as `CLAUDE_CODE_OAUTH_TOKEN` through the
+factory's `env`, or through the agent's own `AgentCommand(env=...)`. An expired login surfaces as an error
+result that quotes the agent's message, so the model can report it instead of retrying blindly.
+
+## Quick start
+
+```python
+from strands import Agent
+from strands_acp_client import make_acp_agent
+
+acp_agent = make_acp_agent(
+    agents=["claude", "codex"],  # known agents, or your own commands (see below)
+    cwd="./repo",                # where the coding agents work
+    timeout=900,                 # seconds per delegated task
+    permissions="read_only",     # what the coding agent may do without asking you
+)
+
+agent = Agent(tools=[acp_agent])
+agent("Ask claude to explain how the retry logic in src/http.py works and whether it has a bug.")
+```
+
+The model sees one tool, `acp_agent`, with these inputs:
+
+| Input | Meaning |
+| --- | --- |
+| `task` | What the coding agent should do, with the context it needs to work on its own. |
+| `agent_name` | Which configured agent to use. Defaults to the first one (or `default_agent`). |
+| `session_id` | A `session_id` from an earlier result, to continue that conversation. |
+| `cwd` | Working directory for this call. Defaults to the factory's `cwd`. |
+
+Each result carries the agent's final message as text plus a JSON block with `session_id`,
+`stop_reason`, token `usage` (when the agent reports it), the `tool_calls` it made (id, title,
+ACP kind, status, file locations), how many permission requests were allowed or denied, and the
+elapsed time.
+
+## Agents
+
+`agents` accepts a list of known names, a single name, or a mapping of your own names to launch
+commands. Commands are taken from the [ACP registry](https://github.com/agentclientprotocol/registry):
+
+| Name | Command | Notes |
+| --- | --- | --- |
+| `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Claude Code through the official adapter |
+| `codex` | `npx -y @agentclientprotocol/codex-acp` | OpenAI Codex CLI through the official adapter |
+| `gemini` | `npx -y @google/gemini-cli --acp` | Gemini CLI |
+| `copilot` | `npx -y @github/copilot --acp` | GitHub Copilot CLI |
+| `qwen` | `npx -y @qwen-code/qwen-code --acp` | Qwen Code |
+| `kiro` | `kiro-cli acp` | Kiro CLI, installed separately |
+| `opencode` | `opencode acp` | OpenCode binary, installed separately |
+| `strands` | `npx -y @strands-agents/cli --acp-server` | A Strands agent served by the Strands CLI |
+
+Anything that speaks ACP on stdin/stdout works:
+
+```python
+from strands_acp_client import AgentCommand, make_acp_agent
+
+acp_agent = make_acp_agent(
+    agents={
+        "claude": "claude",  # alias of a known agent
+        "reviewer": AgentCommand(("npx", "-y", "@agentclientprotocol/codex-acp"), "Codex, used for reviews"),
+        "local": ["python", "my_acp_agent.py"],
+    },
+    default_agent="claude",
+)
+```
+
+The description you give each agent is shown to the model, so say what each one is for.
+
+## Permissions
+
+Under ACP the client owns permissions: when the coding agent wants to do something its own rules
+gate (edit a file, run a command), it asks. This tool answers from a policy, without adding another
+permission system on top of the intervention handlers Strands already has:
+
+| `permissions` | Behaviour |
+| --- | --- |
+| `"read_only"` (default) | Allows `read`, `search`, `fetch` and `think`; refuses edits, deletes, moves and commands. |
+| `"allow_all"` | Grants everything. Right for sandboxed runs, such as a container or an AgentCore Runtime session. |
+| `"deny_all"` | Refuses everything. |
+| a callable | Receives a `PermissionRequest` (agent, tool call title, ACP kind, file locations, offered options) and returns `True`, `False` or an `option_id`. May be async. |
+
+```python
+from strands_acp_client import PermissionRequest, make_acp_agent
+
+def inside_src_only(request: PermissionRequest) -> bool:
+    if request.kind in ("read", "search", "fetch", "think"):
+        return True
+    return request.kind == "edit" and all("/src/" in path for path in request.locations)
+
+acp_agent = make_acp_agent(agents=["claude"], permissions=inside_src_only)
+```
+
+A refused request is answered with the agent's own `reject` option, so the agent sees a refusal and
+can explain itself or try something else; the turn is not aborted. To gate the delegation itself (is
+this task worth handing to a coding agent at all?), use a Strands intervention handler on the
+`acp_agent` tool call, as you would for any other tool.
+
+## Sessions
+
+Every call returns a `session_id`. Passing it back continues the same conversation with the same
+agent process, so the model can ask follow-up questions or request changes to earlier work. Agent
+processes stay alive between calls (`keep_sessions=True`, at most `max_sessions` of them, least
+recently used closed first). Set `keep_sessions=False` to start a fresh process for every task.
+
+Two things to know:
+
+- A session lives in the event loop that created it. Strands runs each synchronous `agent(...)` call
+  on its own loop, so a `session_id` from a previous synchronous call cannot be reused directly. Inside
+  one invocation, and in async applications (`invoke_async`, a web server, AgentCore Runtime), sessions
+  carry over as expected.
+- When the process holding a session is gone, agents that advertise `loadSession` (Claude Code's
+  adapter does) get the session resumed by id in a new process; the result then says `"resumed": true`.
+  Other agents answer with an error asking you to start a new session.
+
+Stop every agent process with:
+
+```python
+await acp_agent.acp_sessions.close_all()
+```
+
+## Watching the agent work
+
+While a task runs, the tool streams progress events (`message_delta`, `tool_call`,
+`tool_call_update`, `permission`) that surface as `tool_stream` events in `Agent.stream_async` and in
+callback handlers. ACP tool kinds (`read`, `edit`, `execute`...) come through on every tool-call
+event, so a UI can render what the coding agent is doing without parsing its output.
+
+## Running on Amazon Bedrock AgentCore Runtime
+
+The tool is a plain Strands tool, so it runs anywhere the agent runs. For AgentCore Runtime, the
+container image needs Node.js and the agent program (or the `npx` cache warmed at build time), plus
+the agent's credentials injected as environment variables. Each Runtime session is its own microVM,
+so `permissions="allow_all"` with `keep_sessions=True` is a reasonable setting there: the coding agent
+can edit and run freely inside the sandbox, and follow-up turns reuse the process.
+
+## How this relates to other pieces
+
+- [strands-acp](https://github.com/ryancormack/strands-acp) exposes a Strands agent to ACP clients
+  (TypeScript, Agent side). This package drives ACP agents from a Strands agent (Python, Client side).
+- [strands-labs/ai-functions](https://github.com/strands-labs/ai-functions) includes an ACP-driven
+  Kiro thread inside its own threads framework. This package is agent-agnostic and a plain tool.
+- A2A is for talking to remote agents over HTTP, MCP is for tools, ACP is for coding agents that
+  run as local processes with their own tools. Pick by what sits on the other side.
+
+## Limits
+
+- ACP protocol version 1, which every listed agent still serves. The ACP v2 draft removes the client
+  file-system and terminal methods; this client never advertised them, so the move will be small.
+- No file-system or terminal delegation: the coding agent uses its own tools in `cwd`. The tool does
+  not sandbox it beyond the permission policy.
+- Permission requests are answered by policy or by your callable. A mode that pauses the Strands
+  agent with an interrupt and asks a human is planned.
+- The agents' own authentication is not handled here; log in as you would in a terminal.
+
+## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install hatch
+hatch run prepare   # format, lint, typecheck, tests
 ```
 
-## What's in this template
-
-The template includes skeleton implementations for all major Strands extension points.
-
-| File | Component | Purpose |
-|------|-----------|---------|
-| `tool.py` | Tool | Add capabilities to agents using the `@tool` decorator |
-| `model.py` | Model provider | Integrate custom LLM APIs |
-| `plugin.py` | Plugin | Extend agent behavior with hooks and tools in a composable package |
-| `intervention.py` | Intervention | Add composable control handlers for authorization, guardrails, and steering |
-| `conversation_manager.py` | Conversation manager | Control context window and message history |
-| `memory_store.py` | Memory store | Give agents cross-session knowledge via a search backend |
-| `storage.py` | Storage | Persist sessions, offloaded context, and other data under string keys |
-
-The setup script will remove components you don't select, so you only keep what you need.
-
-## Implementing your components
-
-Each file contains a minimal skeleton. Here's what to implement:
-
-### Tools
-
-Tools let agents interact with external systems and perform actions. Implement your logic inside the decorated function and return a result dict.
-
-- [Creating custom tools](https://strandsagents.com/docs/user-guide/sdk/tools/custom-tools/) - Documentation
-- [sleep](https://github.com/strands-agents/harness-sdk/blob/main/strands-py/src/strands/vended_tools/sleep/sleep.py) - Simple tool with input validation and error handling
-- [http_request](https://github.com/strands-agents/harness-sdk/tree/main/strands-py/src/strands/vended_tools/http_request) - Tool package with a configuration factory and typed output
-
-### Plugins
-
-Plugins provide a composable way to extend agent behavior by bundling hooks and tools into a single package. Use `@hook` to react to agent lifecycle events and `@tool` to add capabilities, all auto-discovered and registered when the plugin is attached to an agent.
-
-- [Plugins](https://strandsagents.com/docs/user-guide/sdk/plugins/) - Documentation
-- [AgentSkills](https://github.com/strands-agents/harness-sdk/tree/main/strands-py/src/strands/vended_plugins/skills) - Plugin example with hooks and tools
-- [Steering](https://github.com/strands-agents/harness-sdk/tree/main/strands-py/src/strands/vended_plugins/steering) - Advanced plugin example
-
-### Interventions
-
-Intervention handlers provide composable control layers for agents. Override lifecycle methods (like `before_tool_call`) to intercept events and return typed decisions: Proceed, Deny, Guide, Confirm, or Transform. Use them for authorization checks, guardrails, and human-in-the-loop approval.
-
-- [Interventions](https://strandsagents.com/docs/user-guide/sdk/agents/interventions/) - Documentation
-- [Vended interventions](https://github.com/strands-agents/harness-sdk/tree/main/strands-py/src/strands/vended_interventions) - Cedar authorization, HITL, and steering examples
-
-### Model providers
-
-Model providers connect agents to LLM APIs. Implement the `stream()` method to receive messages and yield streaming events.
-
-- [Custom providers](https://strandsagents.com/docs/user-guide/sdk/model-providers/custom_model_provider/) - Documentation
-- [strands-clova](https://github.com/aidendef/strands-clova) - Community model provider example
-
-### Storage
-
-Storage backends persist raw bytes under string keys. Implement `write()`, `read()`, `delete()`, and `list()`; the inherited `search()` gives keyword search on top of them. The SDK's `SnapshotSessionManager` saves sessions through a `Storage`, so implementing one is how you add a session backend such as S3, Redis, or a custom database. Context offloading uses the same interface.
-
-- [Session management](https://strandsagents.com/docs/user-guide/sdk/agents/session-management/) - Documentation
-- [Local file storage](https://github.com/strands-agents/harness-sdk/blob/main/strands-py/src/strands/storage/local_file_storage.py) - Implementation example
-
-### Conversation managers
-
-Conversation managers control the context window and how message history grows over time. They handle trimming old messages or summarizing context to stay within model limits.
-
-- [Conversation management](https://strandsagents.com/docs/user-guide/sdk/agents/conversation-management/) - Documentation
-- [Sliding window manager](https://github.com/strands-agents/harness-sdk/blob/main/strands-py/src/strands/agent/conversation_manager/sliding_window_conversation_manager.py) - Implementation example
-
-### Memory stores
-
-Memory stores give agents cross-session knowledge. A `MemoryManager` searches one or more stores to recall facts and, for writable stores, writes new ones. Implement `search()` to back memory with your own store — a vector database, a managed search service, or any system that retrieves entries by relevance. For writes, implement whichever sinks fit your backend. `add()` for adding an extracted memory. For discrete-entry backend (e.g. a vector DB), only implement this method. `add_messages()` for ingesting raw conversation turns to extract server-side. Only implement this for backends that support server side extraction. Store identity and behavior (`name`, `description`, `max_search_results`, `writable`, `extraction`) come from config via `MemoryStoreConfig`, matching the SDK's own stores; extend `AcpClientMemoryStoreConfig` with any backend-specific fields.
-
-- [Memory](https://strandsagents.com/docs/user-guide/sdk/memory/overview/) - Documentation
-- [Bedrock Knowledge Base store](https://github.com/strands-agents/harness-sdk/tree/main/strands-py/src/strands/vended_memory_stores/bedrock_knowledge_base) - Implementation example
-
-## Testing
-
-Run all checks (format, lint, typecheck, test):
-
-```bash
-hatch run prepare
-```
-
-Or run them individually:
-
-```bash
-hatch run test        # Run tests
-hatch run lint        # Run linter
-hatch run typecheck   # Run type checker
-hatch run format      # Format code
-```
-
-## Publishing to PyPI
-
-You can publish manually or through GitHub Actions.
-
-### Option 1: GitHub release (recommended)
-
-The included workflow automatically publishes to PyPI when you create a GitHub release. Version is derived from the git tag automatically.
-
-1. Configure PyPI trusted publishing first (see below)
-2. Create a release on GitHub with a tag prefixed `v`, e.g. `v0.1.0`. hatch-vcs strips the prefix so the package version is just `0.1.0`.
-3. The workflow runs checks, builds, and publishes
-
-To configure PyPI trusted publishing:
-
-1. Go to PyPI → Your projects → Publishing
-2. Add a new pending publisher with your GitHub repo details
-3. Set environment name to `pypi`
-
-**Note:** If you create a release without configuring trusted publishing, the workflow will fail. Set this up before your first release.
-
-### Option 2: Manual publish
-
-```bash
-hatch build
-pip install twine
-twine upload dist/*
-```
-
-## Naming conventions
-
-Follow these conventions so your package fits the Strands ecosystem:
-
-| Item | Convention | Example |
-|------|------------|---------|
-| PyPI package | `strands-{name}` | `strands-amazon` |
-| Python module | `strands_{name}` | `strands_amazon` |
-| Model class | `{Name}Model` | `AmazonModel` |
-| Plugin class | `{Name}Plugin` | `AmazonPlugin` |
-| Intervention class | `{Name}Intervention` | `CedarIntervention` |
-| Storage class | `{Name}Storage` | `RedisStorage` |
-| Conversation manager | `{Name}ConversationManager` | `SummarizingConversationManager` |
-| Memory store | `{Name}MemoryStore` | `RedisMemoryStore` |
-| Tool function | `{descriptive_name}` | `search_web`, `send_email` |
-
-## Get featured
-
-Help others discover your package by adding the `strands-agents` topic to your GitHub repository. This makes it easier for the community to find Strands extensions.
-
-To add topics: go to your repo → click the ⚙️ gear next to "About" → add `strands-agents` and other relevant topics.
-
-You can also submit your package to be featured on the Strands website. See [Get Featured](https://strandsagents.com/docs/community/get-featured/) for details.
-
-## Resources
-
-- [Strands Agents documentation](https://strandsagents.com/)
-- [Python SDK](https://github.com/strands-agents/harness-sdk/tree/main/strands-py)
-- [SDK vended tools](https://github.com/strands-agents/harness-sdk/tree/main/strands-py/src/strands/vended_tools)
-- [Community packages](https://strandsagents.com/docs/community/community-packages/)
-
-## Security
-
-See [CONTRIBUTING](../CONTRIBUTING.md#security-issue-notifications) for more information.
+Tests run against a scripted ACP agent in `tests/fake_acp_agent.py`, so they need no API keys.
+The `agent-client-protocol` SDK supports Python 3.10 to 3.14; if Hatch picks a newer interpreter,
+point it at a supported one with `HATCH_PYTHON=/path/to/python3.14`.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) for details.
+Apache-2.0. See [LICENSE](LICENSE).
