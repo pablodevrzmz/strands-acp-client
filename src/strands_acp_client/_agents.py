@@ -81,8 +81,10 @@ class AgentCommand:
 # CLI has no way to ask the client over ACP (0.2.x), so read-only is a matter of which built-in
 # tools it is started with. Codex starts in "agent", where it runs and edits on its own; in
 # "read-only" its sandbox lets shell commands read but not write, and it asks before any change.
-# Kilo starts in "code", which edits and runs commands unasked; "ask" is its read-only mode. Its
-# default model needs a Kilo account, while the free router works without one.
+# Kilo starts in "code", which edits and runs commands unasked; "ask" is its read-only mode, where
+# its own shell policy lets read commands through and blocks the ones that write (redirection and
+# "sed -i" were both refused when tried). Its default model needs a Kilo account, while the free
+# router works without one.
 _ASK_FIRST = {"read_only": "default", "deny_all": "default", "custom": "default"}
 _PLAN_ONLY = {"read_only": "plan", "deny_all": "plan"}
 _READ_TOOLS = ("--builtin-tools", "read,web_fetch")
@@ -112,6 +114,7 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
         "Kilo, an open source coding agent",
         modes={"read_only": "ask", "deny_all": "ask"},
         config={"model": "kilo/kilo-auto/free"},
+        sandboxed_kinds=("execute",),
     ),
     "opencode": AgentCommand(
         ("opencode", "acp"),
