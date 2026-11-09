@@ -66,6 +66,9 @@ acp_agent = make_acp_agent(
 
 agent = Agent(tools=[acp_agent])
 agent("Ask claude to explain how the retry logic in src/http.py works and whether it has a bug.")
+agent("Ask it, in the same session, how it would fix that.")
+
+acp_agent.close()  # ends the agent processes; `with make_acp_agent(...) as acp_agent:` does it for you
 ```
 
 The model sees one tool, `acp_agent`, with these inputs:
@@ -73,9 +76,9 @@ The model sees one tool, `acp_agent`, with these inputs:
 | Input | Meaning |
 | --- | --- |
 | `task` | What the coding agent should do, with the context it needs to work on its own. |
-| `agent_name` | Which configured agent to use. Defaults to the first one (or `default_agent`). |
+| `agent_name` | Which configured agent to use. Defaults to the first one (or `default_agent`). Left out when continuing a session. |
 | `session_id` | A `session_id` from an earlier result, to continue that conversation. |
-| `cwd` | Working directory for this call. Defaults to the factory's `cwd`. |
+| `cwd` | Working directory for this call. Defaults to the factory's `cwd`. Left out when continuing a session. |
 
 Every task is sent together with the absolute working directory, so relative paths in the task
 resolve even for an agent whose model cannot run `pwd`. The directory is resolved to its real path
@@ -87,6 +90,13 @@ ACP kind, status, file locations), how many permission requests were allowed or 
 elapsed time. When requests were refused, the text ends with a line naming them, because an agent
 does not always say that it was turned down. An agent that ends its turn right after a refusal, as
 Codex does, is reported as a success with that explanation, not as an error.
+
+When something goes wrong the result is an error the model can act on. An agent that dies is reported
+with its exit code and the last lines it wrote to stderr, which is where an agent says that it is not
+logged in or that a package could not be found. An agent gets `startup_timeout` seconds (120 by
+default, because a first run through `npx` downloads the agent) to start and open its session; one that
+never answers, for instance because it is waiting for a login in a browser, is stopped and reported the
+same way.
 
 ## Agents
 
@@ -213,6 +223,9 @@ def inside_src_only(request: PermissionRequest) -> bool:
 acp_agent = make_acp_agent(agents=["claude"], permissions=inside_src_only)
 ```
 
+A handler is your code, so it runs on the event loop of the tool call it answers for, where the rest of
+your application runs, and not on the tool's own thread (see [Sessions](#sessions)).
+
 A refused request is answered with the agent's own `reject` option, so the agent sees a refusal and
 can explain itself or try something else; the turn is not aborted. To gate the delegation itself (is
 this task worth handing to a coding agent at all?), use a Strands intervention handler on the
@@ -268,26 +281,51 @@ read-only checkout, or an AgentCore Runtime session.
 
 ## Sessions
 
-Every call returns a `session_id`. Passing it back continues the same conversation with the same
-agent process, so the model can ask follow-up questions or request changes to earlier work. Agent
-processes stay alive between calls (`keep_sessions=True`, at most `max_sessions` of them, least
-recently used closed first). Set `keep_sessions=False` to start a fresh process for every task.
+Every call returns a `session_id`. Passing it back, on its own, continues the same conversation with
+the same agent process. The session knows which agent it belongs to and which directory it works in, so
+`agent_name` and `cwd` only matter when a session starts; naming a different agent or directory for an
+existing session is an error, and the session carries on as it was.
 
-Two things to know:
+Agent processes stay alive between calls (`keep_sessions=True`). There are at most `max_sessions` of
+them: beyond that the least recently used idle session is closed, never one that a call is using.
+Calls that share a session take turns. Set `keep_sessions=False` to start a fresh process for every
+task.
 
-- A session lives in the event loop that created it. Strands runs each synchronous `agent(...)` call
-  on its own loop, so a `session_id` from a previous synchronous call cannot be reused directly. Inside
-  one invocation, and in async applications (`invoke_async`, a web server, AgentCore Runtime), sessions
-  carry over as expected.
-- When the process holding a session is gone, agents that advertise `loadSession` (Claude Code's
-  adapter does) get the session resumed by id in a new process; the result then says `"resumed": true`.
-  Other agents answer with an error asking you to start a new session.
+The processes live on an event loop that belongs to the tool, in a background thread it starts on first
+use. That is why a session outlives the call that started it. Strands runs each synchronous
+`agent(...)` call on a new event loop and closes it afterwards, so the two calls in the quick start run
+on two different loops and still reach the same Claude Code process. The same holds for `invoke_async`,
+a web server, AgentCore Runtime, or several threads at once.
 
-Stop every agent process with:
+A session survives a task that failed, timed out or was cancelled, as long as the agent stopped when it
+was asked to, so the model can pick the conversation up again. It is closed when its process dies, when
+the agent ignores a cancellation for `cancel_grace` seconds, and after a policy violation. What happens
+next depends on the agent:
+
+- Agents that advertise `loadSession` (Claude Code's adapter does) get the session resumed by id in a
+  new process, by the agent that owns it. The result then says `"resumed": true`.
+- For the others the session is over. The result carries `"session_id": null` and
+  `"session_closed": true`, so the model does not try to continue something that is gone.
+
+### Closing
 
 ```python
-await acp_agent.acp_sessions.close_all()
+acp_agent.close()                             # every agent process, and the background thread
+await acp_agent.aclose()                      # the same, without holding up your event loop
+await acp_agent.acp_sessions.close_all()      # only the processes
+await acp_agent.acp_sessions.close(session_id)
 ```
+
+`with make_acp_agent(...) as acp_agent:` and `async with` close on the way out. A closed tool can be
+used again; it starts new processes when it needs them. A tool you never close ends its processes when
+it is garbage collected and when the interpreter exits.
+
+Each agent is started as the leader of its own process group, and closing addresses the group: its
+stdin is closed first, which is how an agent on stdio is told to leave, then the group gets SIGTERM, then
+SIGKILL. An agent launched through a wrapper, as `npx` does, cannot outlive its wrapper this way. Two
+consequences are worth knowing. A Ctrl-C in your terminal no longer reaches the agents directly; they
+end when the tool is closed or the interpreter exits. And on Windows, where there is no such group, only
+the launched process is terminated.
 
 ## Watching the agent work
 
@@ -322,6 +360,8 @@ can edit and run freely inside the sandbox, and follow-up turns reuse the proces
 - Permission requests are answered by policy or by your callable. A mode that pauses the Strands
   agent with an interrupt and asks a human is planned.
 - The agents' own authentication is not handled here; log in as you would in a terminal.
+- A process that forks after using the tool gets a child with no sessions of its own: the agents stay
+  with the parent, and the child starts new ones on its first call.
 
 ## Development
 

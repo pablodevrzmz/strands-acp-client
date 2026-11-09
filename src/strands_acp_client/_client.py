@@ -40,6 +40,7 @@ from strands_acp_client._permissions import (
     decide,
     policy_label,
 )
+from strands_acp_client._runtime import CallerGone
 
 __all__ = ["StrandsAcpClient", "Turn"]
 
@@ -54,7 +55,9 @@ class Turn:
     agent work.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, home: asyncio.AbstractEventLoop | None = None) -> None:
+        # The event loop of the tool call that started this turn, where a permission handler runs.
+        self.home = home
         self.text_parts: list[str] = []
         self.thought_chars = 0
         self.tool_calls: dict[str, dict[str, Any]] = {}
@@ -174,7 +177,11 @@ class StrandsAcpClient(Client):
         if turn is not None:
             turn.asked.add(request.tool_call_id)
         try:
-            response, allowed = await decide(self.policy, request)
+            response, allowed = await decide(self.policy, request, turn.home if turn is not None else None)
+        except CallerGone:
+            # The call this turn belongs to is no longer there to be asked, and the turn is on its
+            # way to being cancelled. Nobody said yes, so the answer is no.
+            response, allowed = RequestPermissionResponse(outcome=DeniedOutcome()), False
         except Exception:
             logger.exception("permission handler failed for %s; refusing the call", request.title)
             response, allowed = RequestPermissionResponse(outcome=DeniedOutcome()), False

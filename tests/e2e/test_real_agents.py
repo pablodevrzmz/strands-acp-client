@@ -117,7 +117,7 @@ async def make_real_tool(agent_name: str, workdir: Path):
     yield factory
 
     for built in tools:
-        await built.acp_sessions.close_all()
+        await built.aclose()
 
 
 def _print(label: str, result: dict[str, Any]) -> None:

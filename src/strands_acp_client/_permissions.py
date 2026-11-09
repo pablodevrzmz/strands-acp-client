@@ -9,12 +9,14 @@ intervention handlers it already has.
 
 from __future__ import annotations
 
-import inspect
+import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Union
 
 from acp.schema import AllowedOutcome, DeniedOutcome, PermissionOption, RequestPermissionResponse
+
+from strands_acp_client._runtime import call_on_loop
 
 __all__ = [
     "MUTATING_KINDS",
@@ -85,12 +87,17 @@ def policy_label(policy: PermissionPolicy) -> str:
     return "custom" if callable(policy) else str(policy)
 
 
-async def decide(policy: PermissionPolicy, request: PermissionRequest) -> tuple[RequestPermissionResponse, bool]:
-    """Apply ``policy`` to ``request``. Returns the wire response and whether the call was allowed."""
+async def decide(
+    policy: PermissionPolicy, request: PermissionRequest, home: asyncio.AbstractEventLoop | None = None
+) -> tuple[RequestPermissionResponse, bool]:
+    """Apply ``policy`` to ``request``. Returns the wire response and whether the call was allowed.
+
+    A callable policy is application code, so it is called on ``home``, the event loop of the tool
+    call that the request belongs to, and not on the loop the agent processes live on.
+    """
     decision: PermissionDecision
     if callable(policy):
-        raw = policy(request)
-        decision = await raw if inspect.isawaitable(raw) else raw
+        decision = await call_on_loop(home, policy, request)
     elif policy == "allow_all":
         decision = True
     elif policy == "deny_all":
