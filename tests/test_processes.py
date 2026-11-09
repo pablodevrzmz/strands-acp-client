@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 import sys
 import threading
@@ -139,3 +140,43 @@ async def test_closing_ends_an_agent_that_will_not_leave(make_tool, run_tool, pi
     await built.acp_sessions.close_all()
     assert len(built.acp_sessions) == 0
     assert await eventually(lambda: not is_running(agent_pid)), "the agent was left running after close"
+
+
+# ── found by the review of the first version ──
+
+
+async def test_a_cancellation_while_a_setup_error_is_reported_still_stops_the_agent(
+    make_tool, run_tool, pid_file, monkeypatch
+):
+    cancel_signal = threading.Event()
+    last_words = _process.AgentProcess.last_words
+
+    async def interrupted(self, wait=1.0):
+        cancel_signal.set()  # the caller gives up while the error is being put together
+        return await last_words(self, wait)
+
+    monkeypatch.setattr(_process.AgentProcess, "last_words", interrupted)
+    env = {"FAKE_ACP_LOAD_SESSION": "1", "FAKE_ACP_LOAD_FAIL": "1", "FAKE_ACP_PID_FILE": pid_file}
+    built = make_tool(env=env)
+    _, result = await run_tool(built, task="turn", session_id="earlier", cancel_signal=cancel_signal)
+    assert result["status"] == "error"
+    assert await eventually(lambda: not is_running(read_pid(pid_file))), "the agent outlived its failed start"
+
+
+async def test_an_agent_that_stops_reading_its_stdin_cannot_hold_a_turn(make_tool, run_tool, pid_file, monkeypatch):
+    monkeypatch.setattr(_process, "EXIT_GRACE", 0.3)
+    built = make_tool(timeout=1, cancel_grace=0.5, env={"FAKE_ACP_PID_FILE": pid_file})
+    _, first = await run_tool(built, task="wedge 60")
+    assert result_text(first) == "wedging"
+    await asyncio.sleep(0.5)  # its event loop is now blocked, and nothing reads its stdin
+
+    started = time.perf_counter()
+    _, stuck = await run_tool(built, task="x" * 300_000, session_id=result_json(first)["session_id"])
+    assert time.perf_counter() - started < 8, "a task larger than the pipe must not outlast timeout and grace"
+    assert stuck["status"] == "error"
+    assert result_json(stuck)["stop_reason"] == "timeout"
+    assert await eventually(lambda: not is_running(read_pid(pid_file)))
+
+    started = time.perf_counter()
+    await built.aclose()
+    assert time.perf_counter() - started < 3

@@ -19,7 +19,7 @@ from acp.schema import ClientCapabilities, Implementation, TextContentBlock
 from strands_acp_client._agents import AgentCommand
 from strands_acp_client._client import StrandsAcpClient, Turn
 from strands_acp_client._permissions import PermissionPolicy, policy_label
-from strands_acp_client._process import AgentProcess
+from strands_acp_client._process import EXIT_GRACE, AgentProcess
 from strands_acp_client._runtime import CallCancelled, unless_cancelled
 
 if TYPE_CHECKING:
@@ -149,21 +149,29 @@ class AcpSession:
         _quiet_vendor_notifications()
         try:
             await asyncio.wait_for(self._start(session_id), self.spec.startup_timeout)
-        except asyncio.TimeoutError:
+        except BaseException as exc:
+            # The process is stopped whatever happens next, including a cancellation that arrives
+            # while the error message is being put together: a handler that raises skips its siblings.
+            try:
+                error = await self._start_error(exc)
+            finally:
+                await self.close()
+            if error is None:
+                raise
+            if error is exc:
+                raise
+            raise error from (None if isinstance(exc, asyncio.TimeoutError) else exc)
+
+    async def _start_error(self, exc: BaseException) -> AcpAgentError | None:
+        """The error to report for a failed start, or ``None`` to let ``exc`` (a cancellation) through."""
+        if isinstance(exc, AcpAgentError):
+            return exc
+        if isinstance(exc, asyncio.TimeoutError):
             waited = f"did not finish starting within {self.spec.startup_timeout:g}s"
-            message = await self._with_last_words(f"agent {self.agent_name!r} {waited}", wait=0)
-            await self.close()
-            raise AcpAgentError(message) from None
-        except AcpAgentError:
-            await self.close()
-            raise
-        except Exception as exc:
-            message = await self._with_last_words(f"agent {self.agent_name!r} failed during setup: {exc}")
-            await self.close()
-            raise AcpAgentError(message) from exc
-        except BaseException:  # cancelled half way: the process must not outlive the call that wanted it
-            await self.close()
-            raise
+            return AcpAgentError(await self._with_last_words(f"agent {self.agent_name!r} {waited}", wait=0))
+        if isinstance(exc, Exception):
+            return AcpAgentError(await self._with_last_words(f"agent {self.agent_name!r} failed during setup: {exc}"))
+        return None
 
     async def _start(self, session_id: str | None) -> None:
         argv = self.command.argv_for(self.policy_label)
@@ -320,11 +328,13 @@ class AcpSession:
         await asyncio.shield(self._closing)
 
     async def _close(self) -> None:
-        if self._conn is not None:
-            with contextlib.suppress(Exception):
-                await self._conn.close()
+        # The process first. Closing the connection waits for its writer, and the writer can be stuck
+        # for good on an agent that stopped reading stdin; once the process is gone that write fails.
         if self._process is not None:
             await self._process.stop()
+        if self._conn is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._conn.close(), EXIT_GRACE)
 
     def kill(self) -> None:
         """End the agent process at once, without an event loop: the last resort when the loop is gone."""
@@ -417,10 +427,16 @@ class AcpSession:
             self._lock.release()
 
     async def _cancel_turn(self, conn: ClientSideConnection, request: asyncio.Future[Any]) -> None:
-        """Ask the agent to stop, give it a grace period, then end the process if it ignores us."""
+        """Ask the agent to stop, give it a grace period, then end the process if it ignores us.
+
+        The grace period covers sending the cancellation too: an agent that stopped reading its
+        stdin never receives it, and must not hold the turn past its deadline.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.spec.cancel_grace
         with contextlib.suppress(Exception):
-            await conn.cancel(session_id=self.session_id)
-        done, _ = await asyncio.wait({request}, timeout=self.spec.cancel_grace)
+            await asyncio.wait_for(conn.cancel(session_id=self.session_id), self.spec.cancel_grace)
+        done, _ = await asyncio.wait({request}, timeout=max(deadline - loop.time(), 0.0))
         if request not in done:
             logger.warning(
                 "agent %r ignored session/cancel for %gs; ending its process", self.agent_name, self.spec.cancel_grace

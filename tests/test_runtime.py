@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Any
 
+import pytest
 from strands import Agent
 from strands.tools.decorator import DecoratedFunctionTool
 from strands.types.tools import AgentTool, ToolContext
@@ -156,9 +157,13 @@ async def test_a_call_whose_caller_stopped_listening_is_cancelled(make_tool, run
     await stream.aclose()
 
     session_id = built.acp_sessions.session_ids[0]
+    session = built.acp_sessions._sessions[session_id]
+    assert await eventually(lambda: session.leases == 0), "the abandoned call never gave its session back"
+    assert built.acp_sessions.session_ids == [session_id], "the agent stopped as asked: its session stays"
     started = time.perf_counter()
     _, after = await run_tool(built, task="turn", session_id=session_id)
     assert result_text(after) == "turn 2"
+    assert result_json(after)["session_id"] == session_id
     assert time.perf_counter() - started < 5, "the abandoned turn was left running instead of being cancelled"
 
 
@@ -204,13 +209,75 @@ def test_with_block_closes_the_tool_and_it_can_be_used_again(tmp_path, run_tool,
     assert not is_running(read_pid(pid_file))
 
 
-async def test_async_with_closes_without_blocking_the_loop(tmp_path, run_tool, pid_file):
-    async with make_acp_agent(agents={"fake": FAKE_ARGV}, cwd=tmp_path, env={"FAKE_ACP_PID_FILE": pid_file}) as built:
+async def test_async_with_closes_without_blocking_the_loop(tmp_path, run_tool, pid_file, monkeypatch):
+    from strands_acp_client import _process
+
+    monkeypatch.setattr(_process, "EXIT_GRACE", 0.4)
+    env = {"FAKE_ACP_PID_FILE": pid_file, "FAKE_ACP_IGNORE_EOF": "1"}  # closing it takes a while
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.05)
+            ticks += 1
+
+    async with make_acp_agent(agents={"fake": FAKE_ARGV}, cwd=tmp_path, env=env) as built:
         _, result = await run_tool(built, task="turn")
         assert result["status"] == "success"
         pid = read_pid(pid_file)
+        ticking = asyncio.ensure_future(ticker())
+    ticking.cancel()
+    assert ticks >= 4, "the event loop stood still while the tool was closing"
     assert not is_running(pid)
     assert not built._runtime.running
+
+
+def test_a_copy_of_the_tool_is_the_tool(tmp_path):
+    import copy
+
+    built = make_acp_agent(agents={"fake": FAKE_ARGV}, cwd=tmp_path)
+    assert copy.copy(built) is built and copy.deepcopy(built) is built
+
+
+async def test_a_stream_whose_pump_never_started_still_ends():
+    """A call put on the loop in the same instant the tool is closed must not wait for ever."""
+    import concurrent.futures
+
+    from strands_acp_client._runtime import Runtime, RuntimeClosed
+
+    runtime = Runtime("test")
+
+    def cancelled_before_its_first_step(coro):
+        coro.close()
+        future: concurrent.futures.Future[None] = concurrent.futures.Future()
+        future.cancel()
+        return future
+
+    runtime._submit = cancelled_before_its_first_step  # type: ignore[method-assign]
+
+    async def items():
+        yield "never"
+
+    async def consume() -> None:
+        async for _ in runtime.stream(items):
+            pass
+
+    with pytest.raises(RuntimeClosed):
+        await asyncio.wait_for(consume(), 5)
+
+
+async def test_a_permission_request_outside_a_turn_is_refused_without_asking():
+    from acp.schema import PermissionOption, ToolCallUpdate
+
+    from strands_acp_client._client import StrandsAcpClient
+
+    asked = []
+    client = StrandsAcpClient("fake", lambda request: asked.append(request) or True)
+    options = [PermissionOption(option_id="allow", name="Allow", kind="allow_once")]
+    response = await client.request_permission("s", ToolCallUpdate(tool_call_id="c", kind="edit"), options)
+    assert response.outcome.outcome == "cancelled"
+    assert asked == []
 
 
 async def test_one_session_can_be_closed_by_id(make_tool, run_tool):

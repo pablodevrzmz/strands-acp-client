@@ -10,6 +10,7 @@ Run with ``python tests/fake_acp_agent.py``. The first word of each prompt picks
 - ``stubborn <seconds>``: keep the turn open for that long and ignore ``session/cancel``
 - ``noisy <kib>``: write that many KiB to stderr, more than a pipe holds, then answer
 - ``big <kib>``: answer with a single message chunk of that many KiB, far longer than one buffered line
+- ``wedge <seconds>``: answer, then block its own event loop for that long, so it stops reading stdin
 - ``turn``: answer with the number of prompts seen in this session
 - ``mode``: answer with the session's current mode; ``model``: answer with its current model
 - ``usage``: answer with token usage attached
@@ -27,6 +28,7 @@ advertises ``session/load`` and ``FAKE_ACP_LOADED_TURNS`` seeds the turn counter
 config option instead, and ``FAKE_ACP_MODE`` picks the starting one (the last listed by default).
 ``FAKE_ACP_CONFIG_MODELS=a,b`` offers a ``model`` config option starting at the first one.
 ``FAKE_ACP_REQUIRE_AUTH=<method id>`` refuses sessions until the client authenticates with that method.
+``FAKE_ACP_LOAD_FAIL=1`` answers ``session/load`` with an error and stays running.
 
 For the process itself: ``FAKE_ACP_PID_FILE`` names a file that receives the process id, ``FAKE_ACP_STDERR``
 is a line written to stderr at startup, ``FAKE_ACP_EXIT=<code>`` exits with that code before speaking ACP at
@@ -147,6 +149,8 @@ class FakeAgent(Agent):
         )
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> LoadSessionResponse:
+        if os.environ.get("FAKE_ACP_LOAD_FAIL") == "1":
+            raise RequestError.invalid_params({"session_id": session_id, "detail": "session not found"})
         self._require_auth()
         self._turns[session_id] = int(os.environ.get("FAKE_ACP_LOADED_TURNS", "0"))
         # Replay a bit of history, like a real agent does; the client must not collect it.
@@ -288,6 +292,11 @@ class FakeAgent(Agent):
                 sys.stderr.write(line)  # blocks for good once the pipe is full and nobody reads it
             sys.stderr.flush()
             await self._say(session_id, f"wrote {kib} KiB to stderr")
+            return PromptResponse(stop_reason="end_turn")
+
+        if command == "wedge":
+            asyncio.get_running_loop().call_later(0.2, time.sleep, float(words[1]) if len(words) > 1 else 30.0)
+            await self._say(session_id, "wedging")
             return PromptResponse(stop_reason="end_turn")
 
         if command == "big":
