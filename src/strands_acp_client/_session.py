@@ -30,6 +30,7 @@ except PackageNotFoundError:  # pragma: no cover - source checkout without metad
     _VERSION = "0.0.0"
 
 _CLIENT_INFO = Implementation(name="strands-acp-client", title="Strands ACP client tool", version=_VERSION)
+_AUTH_REQUIRED = -32000
 
 
 class _VendorNotificationFilter(logging.Filter):
@@ -161,25 +162,54 @@ class AcpSession:
                 self.agent_info = {"name": init.agent_info.name, "version": init.agent_info.version}
             self.supports_load = bool(init.agent_capabilities and init.agent_capabilities.load_session)
 
-            if session_id is None:
-                opened = await self._conn.new_session(cwd=self.cwd, mcp_servers=[])
-                self.session_id = opened.session_id
-            else:
-                if not self.supports_load:
-                    raise AcpAgentError(
-                        f"session {session_id!r} is not held by this process and agent {self.agent_name!r} "
-                        "cannot resume sessions; start a new one"
-                    )
-                opened = await self._conn.load_session(cwd=self.cwd, session_id=session_id, mcp_servers=[])
-                self.session_id = session_id
-                self.resumed = True
+            if session_id is not None and not self.supports_load:
+                raise AcpAgentError(
+                    f"session {session_id!r} is not held by this process and agent {self.agent_name!r} "
+                    "cannot resume sessions; start a new one"
+                )
+            try:
+                opened = await self._open(session_id)
+            except RequestError as exc:
+                if exc.code != _AUTH_REQUIRED:
+                    raise
+                await self._authenticate(init.auth_methods or [])
+                opened = await self._open(session_id)
             await self._select_mode(opened)
+            if self.mode is not None:
+                # The agent is in the mode where it confines these kinds itself; see AgentCommand.
+                self.client.exempt_kinds = frozenset(self.command.sandboxed_kinds)
         except AcpAgentError:
             await self.close()
             raise
         except Exception as exc:
             await self.close()
             raise AcpAgentError(f"agent {self.agent_name!r} failed during setup: {exc}") from exc
+
+    async def _open(self, session_id: str | None) -> Any:
+        if session_id is None:
+            opened = await self._conn.new_session(cwd=self.cwd, mcp_servers=[])
+            self.session_id = opened.session_id
+            return opened
+        opened = await self._conn.load_session(cwd=self.cwd, session_id=session_id, mcp_servers=[])
+        self.session_id = session_id
+        self.resumed = True
+        return opened
+
+    async def _authenticate(self, offered: list[Any]) -> None:
+        """Run the ACP authentication step with the method configured for this agent."""
+        ids = [str(method.id) for method in offered]
+        method = self.command.auth_method
+        if method is None:
+            raise AcpAgentError(
+                f"agent {self.agent_name!r} requires authentication and no auth_method is configured for it; "
+                f"it offers: {', '.join(ids) or 'none'}"
+            )
+        if method not in ids:
+            raise AcpAgentError(
+                f"agent {self.agent_name!r} requires authentication but does not offer the configured method "
+                f"{method!r}; it offers: {', '.join(ids) or 'none'}"
+            )
+        await self._conn.authenticate(method_id=method)
 
     async def _select_mode(self, opened: Any) -> None:
         """Switch the session to the mode this agent needs for the current policy, if it offers it."""
@@ -367,7 +397,7 @@ def _describe_failure(exc: BaseException | None) -> str:
     if exc is None:
         return "the agent failed mid-turn"
     if isinstance(exc, RequestError):
-        if exc.code == -32000:
+        if exc.code == _AUTH_REQUIRED:
             return f"the agent requires authentication: {exc}"
         return f"the agent returned an error (code {exc.code}): {exc}"
     return f"the agent failed mid-turn: {exc}"

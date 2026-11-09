@@ -3,6 +3,7 @@
 Run with ``python tests/fake_acp_agent.py``. The first word of each prompt picks a script:
 
 - ``tool <kind>``: report a tool call of that kind, ask permission for it, then say whether it was allowed
+- ``toolstop <kind>``: like ``tool``, but end the turn as ``cancelled`` with no message when refused
 - ``sneak <kind> [seconds]``: complete a tool call of that kind without asking, then wait to see if anyone objects
 - ``slow <seconds>``: keep the turn open until cancelled or the time elapses
 - ``turn``: answer with the number of prompts seen in this session
@@ -20,6 +21,7 @@ Environment: ``FAKE_ACP_PROTOCOL_VERSION`` overrides the negotiated version, ``F
 advertises ``session/load`` and ``FAKE_ACP_LOADED_TURNS`` seeds the turn counter of a loaded session.
 ``FAKE_ACP_MODES=a,b`` offers session modes, ``FAKE_ACP_CONFIG_MODES=a,b`` offers them as the ``mode``
 config option instead, and ``FAKE_ACP_MODE`` picks the starting one (the last listed by default).
+``FAKE_ACP_REQUIRE_AUTH=<method id>`` refuses sessions until the client authenticates with that method.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from acp.schema import (
     AgentThoughtChunk,
     AllowedOutcome,
     AuthenticateResponse,
+    AuthMethodAgent,
     Implementation,
     InitializeResponse,
     LoadSessionResponse,
@@ -75,6 +78,8 @@ class FakeAgent(Agent):
         self._next = 0
         self._turns: dict[str, int] = {}
         self._modes: dict[str, str] = {}
+        self._required_auth = os.environ.get("FAKE_ACP_REQUIRE_AUTH")
+        self._authenticated = False
         self._cancelled: dict[str, asyncio.Event] = {}
 
     def on_connect(self, conn: Client) -> None:
@@ -92,12 +97,21 @@ class FakeAgent(Agent):
             protocol_version=version,
             agent_capabilities=AgentCapabilities(load_session=load),
             agent_info=Implementation(name="fake-agent", version="0.0.1"),
+            auth_methods=[AuthMethodAgent(id=self._required_auth, name="Fake key")] if self._required_auth else [],
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse:
+        if self._required_auth and method_id != self._required_auth:
+            raise RequestError.invalid_params({"method": method_id})
+        self._authenticated = True
         return AuthenticateResponse()
 
+    def _require_auth(self) -> None:
+        if self._required_auth and not self._authenticated:
+            raise RequestError.auth_required()
+
     async def new_session(self, cwd: str, **kwargs: Any) -> NewSessionResponse:
+        self._require_auth()
         session_id = f"fake-{os.getpid()}-{self._next}"
         self._next += 1
         self._turns[session_id] = 0
@@ -106,6 +120,7 @@ class FakeAgent(Agent):
         )
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> LoadSessionResponse:
+        self._require_auth()
         self._turns[session_id] = int(os.environ.get("FAKE_ACP_LOADED_TURNS", "0"))
         # Replay a bit of history, like a real agent does; the client must not collect it.
         await self._say(session_id, "replayed history")
@@ -163,7 +178,7 @@ class FakeAgent(Agent):
         words = text.split()
         command = words[0] if words else ""
 
-        if command == "tool":
+        if command in ("tool", "toolstop"):
             kind = words[1] if len(words) > 1 else "edit"
             call_id = f"call-{self._turns[session_id]}"
             title = f"{kind} example.txt"
@@ -183,6 +198,8 @@ class FakeAgent(Agent):
             await self.conn.session_update(
                 session_id, ToolCallProgress(tool_call_id=call_id, status="completed" if allowed else "failed")
             )
+            if command == "toolstop" and not allowed:
+                return PromptResponse(stop_reason="cancelled")
             await self._say(session_id, f"permission {'allowed' if allowed else 'denied'} via {selected}")
             return PromptResponse(stop_reason="end_turn")
 

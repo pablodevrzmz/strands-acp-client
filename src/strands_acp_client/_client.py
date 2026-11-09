@@ -89,6 +89,7 @@ class StrandsAcpClient(Client):
         # A policy only answers questions. With ``strict`` the client also notices a change the
         # agent made without asking, so a restrictive policy fails loudly instead of silently.
         self.guard = strict and policy_label(policy) != "allow_all"
+        self.exempt_kinds: frozenset[str] = frozenset()
         self._always_allowed: set[str] = set()
 
     def on_connect(self, conn: Agent) -> None:
@@ -142,7 +143,7 @@ class StrandsAcpClient(Client):
         if not self.guard or turn.violation is not None:
             return
         kind = entry["kind"]
-        if entry["status"] != "completed" or kind not in MUTATING_KINDS:
+        if entry["status"] != "completed" or kind not in MUTATING_KINDS or kind in self.exempt_kinds:
             return
         if entry["id"] in turn.asked or kind in self._always_allowed:
             return

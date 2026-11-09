@@ -25,6 +25,12 @@ class AgentCommand:
         policy_args: Extra arguments appended to ``argv`` for a permission policy, keyed the same way.
             For agents whose restricted behaviour is chosen at launch rather than per session, e.g.
             ``{"read_only": ("--builtin-tools", "read,web_fetch")}`` for the Strands CLI.
+        auth_method: Id of the ACP authentication method to use when the agent answers "authentication
+            required", e.g. ``"api-key"`` for Codex. The agent reads the credential itself, usually from
+            an environment variable; nothing secret passes through this package.
+        sandboxed_kinds: Tool kinds the agent confines by itself once the policy's mode is active, so
+            completing one without asking is not a violation. Codex in ``read-only`` runs every shell
+            command inside an operating-system sandbox, which is how it reads files.
     """
 
     argv: tuple[str, ...]
@@ -32,6 +38,8 @@ class AgentCommand:
     env: Mapping[str, str | None] | None = None
     modes: Mapping[str, str] | None = None
     policy_args: Mapping[str, Sequence[str]] | None = None
+    auth_method: str | None = None
+    sandboxed_kinds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.argv or not self.argv[0] or not all(isinstance(part, str) for part in self.argv):
@@ -45,6 +53,13 @@ class AgentCommand:
         """
         return replace(self, argv=(*self.argv, *args))
 
+    def with_env(self, **env: str | None) -> AgentCommand:
+        """A copy of this command with more environment changes (``None`` removes a variable).
+
+        ``KNOWN_AGENTS["codex"].with_env(MODEL_PROVIDER="ollama")`` points Codex at a local model.
+        """
+        return replace(self, env={**(self.env or {}), **env})
+
     def argv_for(self, policy: str) -> tuple[str, ...]:
         """The full command line for a permission policy."""
         return (*self.argv, *(self.policy_args or {}).get(policy, ()))
@@ -55,16 +70,26 @@ class AgentCommand:
 # same story: it starts in "auto", where a classifier decides, and asks in "default". OpenCode's
 # "plan" is its read-only agent; it starts in "build", which edits without asking. The Strands
 # CLI has no way to ask the client over ACP (0.2.x), so read-only is a matter of which built-in
-# tools it is started with.
+# tools it is started with. Codex starts in "agent", where it runs and edits on its own; in
+# "read-only" its sandbox lets shell commands read but not write, and it asks before any change.
 _ASK_FIRST = {"read_only": "default", "deny_all": "default", "custom": "default"}
 _PLAN_ONLY = {"read_only": "plan", "deny_all": "plan"}
 _READ_TOOLS = ("--builtin-tools", "read,web_fetch")
+_SANDBOX_READ_ONLY = {"read_only": "read-only", "deny_all": "read-only", "custom": "read-only"}
 
 KNOWN_AGENTS: dict[str, AgentCommand] = {
     "claude": AgentCommand(
         ("npx", "-y", "@agentclientprotocol/claude-agent-acp"),
         "Claude Code through the official ACP adapter",
         modes=_ASK_FIRST,
+    ),
+    "codex": AgentCommand(
+        ("npx", "-y", "@agentclientprotocol/codex-acp"),
+        "OpenAI Codex through the official ACP adapter",
+        env={"NO_BROWSER": "1"},  # a tool call must never try to open a browser to log in
+        modes=_SANDBOX_READ_ONLY,
+        auth_method="api-key",
+        sandboxed_kinds=("execute",),
     ),
     "qwen": AgentCommand(
         ("npx", "-y", "@qwen-code/qwen-code", "--acp"),

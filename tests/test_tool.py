@@ -40,7 +40,7 @@ def test_agents_argument_shapes(tmp_path):
     custom = make_acp_agent(agents={"mine": AgentCommand(("my-agent", "--acp"), "my agent")}, cwd=tmp_path)
     assert "mine (my agent)" in custom.tool_spec["description"]
     # Presets exist only for agents the end-to-end suite has driven for real.
-    assert set(KNOWN_AGENTS) == {"claude", "opencode", "qwen", "strands"}
+    assert set(KNOWN_AGENTS) == {"claude", "codex", "opencode", "qwen", "strands"}
     with pytest.raises(ValueError, match="Pass argv explicitly"):
         make_acp_agent(agents=["gemini"], cwd=tmp_path)
     unverified = make_acp_agent(agents={"gemini": ["npx", "-y", "@google/gemini-cli", "--acp"]}, cwd=tmp_path)
@@ -453,3 +453,65 @@ def test_refused_calls_are_named_with_their_kind():
     assert _describe_call("Edit calc.py", "edit") == "Edit calc.py"
     assert _describe_call(None, "execute") == "execute"
     assert _describe_call(None, None) == "a tool call"
+
+
+# ── what Codex needed: an authentication step, self-sandboxed kinds, and stopping on a refusal ──
+
+
+async def test_an_agent_that_requires_authentication_gets_the_configured_method(make_tool, run_tool):
+    command = AgentCommand(FAKE_ARGV, "fake", auth_method="fake-key")
+    built = make_tool(agents={"fake": command}, env={"FAKE_ACP_REQUIRE_AUTH": "fake-key"})
+    _, result = await run_tool(built, task="hello")
+    assert result["status"] == "success"
+    assert result_text(result) == "You said: hello"
+
+
+async def test_authentication_without_a_usable_method_is_explained(make_tool, run_tool):
+    env = {"FAKE_ACP_REQUIRE_AUTH": "fake-key"}
+    _, missing = await run_tool(make_tool(env=env), task="hello")
+    assert missing["status"] == "error"
+    assert "requires authentication and no auth_method is configured" in result_text(missing)
+    assert "it offers: fake-key" in result_text(missing)
+
+    wrong = AgentCommand(FAKE_ARGV, "fake", auth_method="chatgpt")
+    built = make_tool(agents={"fake": wrong}, env=env)
+    _, refused = await run_tool(built, task="hello")
+    assert refused["status"] == "error"
+    assert "does not offer the configured method 'chatgpt'" in result_text(refused)
+    assert len(built.acp_sessions) == 0
+
+
+async def test_sandboxed_kinds_are_exempt_only_once_the_mode_is_active(make_tool, run_tool):
+    command = AgentCommand(FAKE_ARGV, "fake", modes={"read_only": "ask"}, sandboxed_kinds=("execute",))
+    with_mode = make_tool(agents={"fake": command}, env={"FAKE_ACP_MODES": "ask,auto"})
+    _, reading = await run_tool(with_mode, task="sneak execute 0.2")
+    assert reading["status"] == "success", "the agent sandboxes its own commands in this mode"
+    _, editing = await run_tool(with_mode, task="sneak edit")
+    assert result_json(editing)["stop_reason"] == "policy_violation", "an unasked edit is still a violation"
+
+    # The agent does not offer the mode, so nothing guarantees the sandbox: commands are guarded again.
+    without_mode = make_tool(agents={"fake": command})
+    _, unguarded = await run_tool(without_mode, task="sneak execute")
+    assert result_json(unguarded)["stop_reason"] == "policy_violation"
+
+
+async def test_an_agent_that_stops_after_a_refusal_is_not_an_error(make_tool, run_tool):
+    _, result = await run_tool(make_tool(), task="toolstop edit")
+    assert result["status"] == "success"
+    assert result_json(result)["stop_reason"] == "cancelled"
+    text = result_text(result)
+    assert text.startswith("The agent stopped after a permission request was refused.")
+    assert text.endswith("Refused under the read_only policy: edit example.txt.")
+
+
+def test_with_env_and_the_codex_preset():
+    codex = KNOWN_AGENTS["codex"]
+    assert codex.auth_method == "api-key"
+    assert codex.sandboxed_kinds == ("execute",)
+    assert codex.modes == {"read_only": "read-only", "deny_all": "read-only", "custom": "read-only"}
+    assert codex.env == {"NO_BROWSER": "1"}
+
+    local = codex.with_env(MODEL_PROVIDER="ollama", NO_BROWSER=None)
+    assert local.env == {"NO_BROWSER": None, "MODEL_PROVIDER": "ollama"}
+    assert local.argv == codex.argv and local.modes == codex.modes and local.auth_method == "api-key"
+    assert codex.env == {"NO_BROWSER": "1"}, "with_env must not change the original"

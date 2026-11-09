@@ -6,8 +6,8 @@
 
 Use coding agents as tools from a [Strands Agents](https://strandsagents.com) agent, over the
 [Agent Client Protocol](https://agentclientprotocol.com) (ACP). Verified end to end with Claude Code,
-OpenCode, Qwen Code and a Strands agent served by the Strands CLI; any other ACP agent plugs in by its
-command.
+Codex, OpenCode, Qwen Code and a Strands agent served by the Strands CLI; any other ACP agent plugs in
+by its command.
 Your agent delegates a task, the coding agent works in a directory with its own tools, and the final
 answer comes back as a tool result together with a `session_id` for follow-ups.
 
@@ -26,6 +26,10 @@ The agents themselves are separate programs. Claude Code's adapter and the Stran
 `npx`, so Node.js 20+ must be on `PATH`; OpenCode is a binary you install first. Each agent needs its
 own login or model provider exactly as it does in a terminal (for example `claude auth login` for
 Claude Code, or a local Ollama model for the Strands CLI).
+
+Codex authenticates over ACP rather than from a saved login. With `CODEX_API_KEY` or `OPENAI_API_KEY` in
+the environment the tool completes that step by itself (`auth_method="api-key"` on the preset); a
+local model provider needs no key at all.
 
 For unattended runs, give the agent a credential that does not depend on an interactive login. Claude Code
 issues long-lived tokens with `claude setup-token`; pass one as `CLAUDE_CODE_OAUTH_TOKEN` through the
@@ -80,7 +84,8 @@ Each result carries the agent's final message as text plus a JSON block with `se
 `stop_reason`, token `usage` (when the agent reports it), the `tool_calls` it made (id, title,
 ACP kind, status, file locations), how many permission requests were allowed or denied, and the
 elapsed time. When requests were refused, the text ends with a line naming them, because an agent
-does not always say that it was turned down.
+does not always say that it was turned down. An agent that ends its turn right after a refusal, as
+Codex does, is reported as a success with that explanation, not as an error.
 
 ## Agents
 
@@ -91,6 +96,7 @@ list is short on purpose:
 | Name | Command | Verified with |
 | --- | --- | --- |
 | `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Claude Code 2.1, adapter 0.101 |
+| `codex` | `npx -y @agentclientprotocol/codex-acp` | Codex adapter 2.6 on a local Ollama model |
 | `opencode` | `opencode acp` | OpenCode 1.18 |
 | `qwen` | `npx -y @qwen-code/qwen-code --acp` | Qwen Code 0.27 on a local Ollama model |
 | `strands` | `npx -y @strands-agents/cli --acp-server` | Strands CLI 0.2.4 on a local Ollama model |
@@ -137,6 +143,15 @@ local_qwen = KNOWN_AGENTS["qwen"].with_args(
     "-m", "qwen3.8:27b",
 )
 ```
+
+Codex takes its provider from the environment instead, so extend it with `with_env`:
+
+```python
+local_codex = KNOWN_AGENTS["codex"].with_env(MODEL_PROVIDER="ollama", CODEX_CONFIG='{"model": "qwen3.8:27b"}')
+```
+
+On a model Codex does not know, each answer starts with a one-line warning about missing model
+metadata. It comes from Codex and is left as it is.
 
 ## Permissions
 
@@ -185,6 +200,7 @@ permission request. So the tool does two more things under every policy except `
 | Agent | Starts in | Under a restrictive policy | An edit under `read_only` |
 | --- | --- | --- | --- |
 | `claude` | your Claude Code settings, often `auto` | switched to `default` ("always ask before making changes") | the agent asks, the policy refuses |
+| `codex` | `agent`, where it runs and edits on its own | switched to `read-only` | its sandbox lets commands read; it asks before any change and the policy refuses |
 | `qwen` | `auto`, where a classifier decides | switched to `default` | the agent asks, the policy refuses |
 | `opencode` | `build` | switched to `plan` for `read_only` and `deny_all` | the agent declines on its own |
 | `strands` | every built-in tool, nobody asked | started with `--builtin-tools read,web_fetch` for `read_only` and `deny_all` | the agent has no tool to edit with |
@@ -196,6 +212,11 @@ For your own agents, declare the modes or the arguments on the command:
 AgentCommand(("my-agent", "--acp"), "my agent", modes={"read_only": "ask", "deny_all": "ask", "custom": "ask"})
 AgentCommand(("my-agent", "--acp"), "my agent", policy_args={"read_only": ("--no-write",)})
 ```
+
+Two more fields cover what Codex needed. `auth_method` names the ACP authentication method to run when
+the agent answers "authentication required". `sandboxed_kinds` lists tool kinds the agent confines by
+itself once its restricted mode is active: Codex reads files with shell commands inside an
+operating-system sandbox, so an unasked `execute` is expected there and is not treated as a violation.
 
 OpenCode and the Strands CLI (0.2.x) have no way to consult a custom handler: OpenCode's `build` mode
 and the Strands CLI's stock tools act without asking, and `strict` reports that as a violation. For
@@ -283,9 +304,9 @@ ACP_E2E_AGENTS=claude,opencode hatch run test tests/e2e -v -s
 Each scenario gives the agent a small file with an obvious bug and checks five things: it can explain
 the bug without touching the file, it fixes it under `allow_all`, the edit does not happen under
 `read_only`, a custom handler is either consulted or the unasked change is reported as a violation,
-and a second task with the returned `session_id` remembers the first. Claude Code 2.1 (adapter 0.101),
-OpenCode 1.18, and Qwen Code 0.27 and the Strands CLI 0.2.4 on a local Ollama model pass all five. The
-last two need no account and no key:
+and a second task with the returned `session_id` remembers the first. Claude Code 2.1 (adapter 0.101)
+and OpenCode 1.18 pass all five, and so do Codex (adapter 2.6), Qwen Code 0.27 and the Strands CLI 0.2.4
+on a local Ollama model. Those three need no account and no key:
 
 ```bash
 ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
