@@ -8,6 +8,9 @@ known agent with more flags, or ``name=argv`` for any command:
     ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
     ACP_E2E_AGENTS='qwen+--auth-type openai --openai-base-url http://localhost:11434/v1 --openai-api-key ollama
         -m qwen3.8:27b' hatch run test tests/e2e -v -s
+    MODEL_PROVIDER=ollama CODEX_CONFIG='{"model": "qwen3.8:27b"}' ACP_E2E_AGENTS=codex hatch run test tests/e2e -v -s
+
+An agent that takes its provider from the environment (Codex) simply inherits it from this process.
 
 Each scenario works in a fresh temporary directory holding a tiny Python file with an obvious bug,
 so the agent has something concrete to read, explain and fix.

@@ -201,9 +201,15 @@ def _annotations(label: str) -> dict[str, Any]:
 
 
 def _tool_result(agent_name: str, session: AcpSession, label: str, result: TurnResult) -> dict[str, Any]:
-    status = "success" if result.error is None and result.stop_reason in _SUCCESS_STOP_REASONS else "error"
+    # Some agents (Codex) end the turn as "cancelled" when a permission is refused. That is the
+    # policy doing its job, not a failure of the delegation.
+    stopped_on_refusal = result.stop_reason == "cancelled" and result.error is None and bool(result.refused)
+    finished = result.stop_reason in _SUCCESS_STOP_REASONS or stopped_on_refusal
+    status = "success" if result.error is None and finished else "error"
     text = result.text.strip()
-    if result.error is not None:
+    if stopped_on_refusal:
+        text = "The agent stopped after a permission request was refused." + (f"\n\n{text}" if text else "")
+    elif result.error is not None:
         text = f"{result.error}." + (f"\n\nPartial output:\n{text}" if text else "")
     elif result.stop_reason == "refusal":
         text = "The agent refused the task." + (f"\n\n{text}" if text else "")
