@@ -79,7 +79,9 @@ def make_acp_agent(
         raise ValueError(f"default_agent {default!r} is not one of the configured agents: {', '.join(resolved)}")
     if timeout <= 0:
         raise ValueError("timeout must be positive")
-    base_cwd = os.path.abspath(os.fspath(cwd)) if cwd is not None else os.getcwd()
+    # The real path, not a symlinked one: agents compare the files they touch with the session's
+    # directory, and a path that only looks different sends them asking about an "external" folder.
+    base_cwd = os.path.realpath(os.fspath(cwd)) if cwd is not None else os.path.realpath(os.getcwd())
     if not os.path.isdir(base_cwd):
         raise ValueError(f"cwd {base_cwd!r} is not a directory")
 
@@ -102,7 +104,7 @@ def make_acp_agent(
         if not task or not task.strip():
             yield _error("task must not be empty")
             return
-        work_dir = os.path.abspath(cwd) if cwd else base_cwd
+        work_dir = os.path.realpath(cwd) if cwd else base_cwd
         if not os.path.isdir(work_dir):
             yield _error(f"cwd {work_dir!r} is not a directory")
             return
@@ -234,6 +236,8 @@ def _tool_result(agent_name: str, session: AcpSession, label: str, result: TurnR
         "permissions": {"policy": label, "allowed": result.allowed, "denied": result.denied},
         "elapsed_seconds": round(result.elapsed, 2),
     }
+    if session.config:
+        details["config"] = dict(session.config)
     if result.refused:
         details["refused"] = list(result.refused)
     if result.violation is not None:

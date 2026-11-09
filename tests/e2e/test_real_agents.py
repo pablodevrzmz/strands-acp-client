@@ -4,7 +4,7 @@ These tests cost model tokens and need the agents logged in, so they never run b
 Select the agents with ``ACP_E2E_AGENTS``: known names from ``KNOWN_AGENTS``, ``name+extra args`` for a
 known agent with more flags, or ``name=argv`` for any command:
 
-    ACP_E2E_AGENTS=claude,opencode hatch run test tests/e2e -v -s
+    ACP_E2E_AGENTS=claude,opencode,kilo hatch run test tests/e2e -v -s
     ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
     ACP_E2E_AGENTS='qwen+--auth-type openai --openai-base-url http://localhost:11434/v1 --openai-api-key ollama
         -m qwen3.8:27b' hatch run test tests/e2e -v -s

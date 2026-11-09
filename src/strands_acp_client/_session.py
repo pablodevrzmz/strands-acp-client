@@ -105,6 +105,7 @@ class AcpSession:
         self.client = StrandsAcpClient(agent_name, policy, strict=strict)
         self.session_id: str = ""
         self.mode: str | None = None
+        self.config: dict[str, str] = {}
         self.resumed = False
         self.agent_info: dict[str, Any] | None = None
         self.supports_load = False
@@ -175,6 +176,7 @@ class AcpSession:
                 await self._authenticate(init.auth_methods or [])
                 opened = await self._open(session_id)
             await self._select_mode(opened)
+            await self._apply_config(opened)
             if self.mode is not None:
                 # The agent is in the mode where it confines these kinds itself; see AgentCommand.
                 self.client.exempt_kinds = frozenset(self.command.sandboxed_kinds)
@@ -229,6 +231,29 @@ class AcpSession:
                 self.mode = wanted
                 return
         logger.info("agent %r does not offer mode %r; relying on its own defaults", self.agent_name, wanted)
+
+    async def _apply_config(self, opened: Any) -> None:
+        """Set the session options configured for this agent (its model, for instance)."""
+        wanted = self.command.config or {}
+        if not wanted:
+            return
+        offered = {str(getattr(option, "id", "")): option for option in getattr(opened, "config_options", None) or []}
+        for option_id, value in wanted.items():
+            option = offered.get(option_id)
+            if option is None:
+                raise AcpAgentError(
+                    f"agent {self.agent_name!r} has no session option {option_id!r}; "
+                    f"it offers: {', '.join(sorted(offered)) or 'none'}"
+                )
+            choices = _select_values(option)
+            if choices and value not in choices:
+                shown = ", ".join(choices[:12]) + (f" and {len(choices) - 12} more" if len(choices) > 12 else "")
+                raise AcpAgentError(
+                    f"agent {self.agent_name!r} does not offer {value!r} for {option_id!r}; choices: {shown}"
+                )
+            if getattr(option, "current_value", None) != value:
+                await self._conn.set_config_option(config_id=option_id, session_id=self.session_id, value=value)
+            self.config[option_id] = value
 
     @property
     def alive(self) -> bool:

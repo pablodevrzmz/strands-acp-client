@@ -25,6 +25,10 @@ class AgentCommand:
         policy_args: Extra arguments appended to ``argv`` for a permission policy, keyed the same way.
             For agents whose restricted behaviour is chosen at launch rather than per session, e.g.
             ``{"read_only": ("--builtin-tools", "read,web_fetch")}`` for the Strands CLI.
+        config: Session options to set on every session, by ACP config option id, e.g.
+            ``{"model": "kilo/kilo-auto/free"}``. The agent lists its options and their choices when a
+            session opens; an id or a value it does not offer is an error that names the choices, so a
+            misspelled model never falls back silently to a default you may be paying for.
         auth_method: Id of the ACP authentication method to use when the agent answers "authentication
             required", e.g. ``"api-key"`` for Codex. The agent reads the credential itself, usually from
             an environment variable; nothing secret passes through this package.
@@ -38,6 +42,7 @@ class AgentCommand:
     env: Mapping[str, str | None] | None = None
     modes: Mapping[str, str] | None = None
     policy_args: Mapping[str, Sequence[str]] | None = None
+    config: Mapping[str, str] | None = None
     auth_method: str | None = None
     sandboxed_kinds: tuple[str, ...] = ()
 
@@ -60,6 +65,10 @@ class AgentCommand:
         """
         return replace(self, env={**(self.env or {}), **env})
 
+    def with_config(self, **options: str) -> AgentCommand:
+        """A copy of this command with more session options, e.g. ``with_config(model="sonnet")``."""
+        return replace(self, config={**(self.config or {}), **options})
+
     def argv_for(self, policy: str) -> tuple[str, ...]:
         """The full command line for a permission policy."""
         return (*self.argv, *(self.policy_args or {}).get(policy, ()))
@@ -72,6 +81,8 @@ class AgentCommand:
 # CLI has no way to ask the client over ACP (0.2.x), so read-only is a matter of which built-in
 # tools it is started with. Codex starts in "agent", where it runs and edits on its own; in
 # "read-only" its sandbox lets shell commands read but not write, and it asks before any change.
+# Kilo starts in "code", which edits and runs commands unasked; "ask" is its read-only mode. Its
+# default model needs a Kilo account, while the free router works without one.
 _ASK_FIRST = {"read_only": "default", "deny_all": "default", "custom": "default"}
 _PLAN_ONLY = {"read_only": "plan", "deny_all": "plan"}
 _READ_TOOLS = ("--builtin-tools", "read,web_fetch")
@@ -95,6 +106,12 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
         ("npx", "-y", "@qwen-code/qwen-code", "--acp"),
         "Qwen Code",
         modes=_ASK_FIRST,
+    ),
+    "kilo": AgentCommand(
+        ("npx", "-y", "@kilocode/cli", "acp"),
+        "Kilo, an open source coding agent",
+        modes={"read_only": "ask", "deny_all": "ask"},
+        config={"model": "kilo/kilo-auto/free"},
     ),
     "opencode": AgentCommand(
         ("opencode", "acp"),

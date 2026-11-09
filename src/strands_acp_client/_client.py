@@ -155,17 +155,22 @@ class StrandsAcpClient(Client):
     async def request_permission(
         self, session_id: str, tool_call: ToolCallUpdate, options: list[PermissionOption], **kwargs: Any
     ) -> RequestPermissionResponse:
+        turn = self.turn
+        kind = tool_call.kind
+        if kind in (None, "other") and turn is not None:
+            # Some agents (Kilo) ask with a bare "other" although they already reported the call as an
+            # edit or a search. The policy should judge the call by what it is.
+            kind = turn.tool_calls.get(tool_call.tool_call_id, {}).get("kind") or kind
         request = PermissionRequest(
             agent=self.agent_name,
             session_id=session_id,
             tool_call_id=tool_call.tool_call_id,
             title=tool_call.title,
-            kind=tool_call.kind,
+            kind=kind,
             locations=tuple(location.path for location in tool_call.locations or []),
             options=tuple(options),
             raw_input=tool_call.raw_input,
         )
-        turn = self.turn
         if turn is not None:
             turn.asked.add(request.tool_call_id)
         try:
