@@ -3,11 +3,12 @@
 Run with ``python tests/fake_acp_agent.py``. The first word of each prompt picks a script:
 
 - ``tool <kind>``: report a tool call of that kind, ask permission for it, then say whether it was allowed
+- ``vague <kind>``: like ``tool``, but the permission request itself only says ``other``
 - ``toolstop <kind>``: like ``tool``, but end the turn as ``cancelled`` with no message when refused
 - ``sneak <kind> [seconds]``: complete a tool call of that kind without asking, then wait to see if anyone objects
 - ``slow <seconds>``: keep the turn open until cancelled or the time elapses
 - ``turn``: answer with the number of prompts seen in this session
-- ``mode``: answer with the session's current mode
+- ``mode``: answer with the session's current mode; ``model``: answer with its current model
 - ``usage``: answer with token usage attached
 - ``refuse``: end the turn with stop reason ``refusal``
 - ``fail``: answer with an "authentication required" error; ``error``: answer with an internal error
@@ -21,6 +22,7 @@ Environment: ``FAKE_ACP_PROTOCOL_VERSION`` overrides the negotiated version, ``F
 advertises ``session/load`` and ``FAKE_ACP_LOADED_TURNS`` seeds the turn counter of a loaded session.
 ``FAKE_ACP_MODES=a,b`` offers session modes, ``FAKE_ACP_CONFIG_MODES=a,b`` offers them as the ``mode``
 config option instead, and ``FAKE_ACP_MODE`` picks the starting one (the last listed by default).
+``FAKE_ACP_CONFIG_MODELS=a,b`` offers a ``model`` config option starting at the first one.
 ``FAKE_ACP_REQUIRE_AUTH=<method id>`` refuses sessions until the client authenticates with that method.
 """
 
@@ -78,6 +80,7 @@ class FakeAgent(Agent):
         self._next = 0
         self._turns: dict[str, int] = {}
         self._modes: dict[str, str] = {}
+        self._models: dict[str, str] = {}
         self._required_auth = os.environ.get("FAKE_ACP_REQUIRE_AUTH")
         self._authenticated = False
         self._cancelled: dict[str, asyncio.Event] = {}
@@ -141,19 +144,32 @@ class FakeAgent(Agent):
         )
 
     def _config_options(self, session_id: str) -> list[SessionConfigOptionSelect] | None:
+        options: list[SessionConfigOptionSelect] = []
         offered = _listed("FAKE_ACP_CONFIG_MODES")
-        if not offered:
-            return None
-        current = self._modes.setdefault(session_id, self._starting_mode(offered))
-        return [
-            SessionConfigOptionSelect(
-                id="mode",
-                name="Mode",
-                category="mode",
-                current_value=current,
-                options=[SessionConfigSelectOption(value=mode, name=mode.title()) for mode in offered],
+        if offered:
+            current = self._modes.setdefault(session_id, self._starting_mode(offered))
+            options.append(
+                SessionConfigOptionSelect(
+                    id="mode",
+                    name="Mode",
+                    category="mode",
+                    current_value=current,
+                    options=[SessionConfigSelectOption(value=mode, name=mode.title()) for mode in offered],
+                )
             )
-        ]
+        models = _listed("FAKE_ACP_CONFIG_MODELS")
+        if models:
+            current = self._models.setdefault(session_id, models[0])
+            options.append(
+                SessionConfigOptionSelect(
+                    id="model",
+                    name="Model",
+                    category="model",
+                    current_value=current,
+                    options=[SessionConfigSelectOption(value=model, name=model) for model in models],
+                )
+            )
+        return options or None
 
     async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> SetSessionModeResponse:
         self._modes[session_id] = mode_id
@@ -164,6 +180,8 @@ class FakeAgent(Agent):
     ) -> SetSessionConfigOptionResponse:
         if config_id == "mode":
             self._modes[session_id] = str(value)
+        if config_id == "model":
+            self._models[session_id] = str(value)
         return SetSessionConfigOptionResponse(config_options=self._config_options(session_id) or [])
 
     # ── prompts ──
@@ -178,7 +196,7 @@ class FakeAgent(Agent):
         words = text.split()
         command = words[0] if words else ""
 
-        if command in ("tool", "toolstop"):
+        if command in ("tool", "toolstop", "vague"):
             kind = words[1] if len(words) > 1 else "edit"
             call_id = f"call-{self._turns[session_id]}"
             title = f"{kind} example.txt"
@@ -189,7 +207,11 @@ class FakeAgent(Agent):
             response = await self.conn.request_permission(
                 session_id=session_id,
                 tool_call=ToolCallUpdate(
-                    tool_call_id=call_id, title=title, kind=kind, status="pending", locations=location
+                    tool_call_id=call_id,
+                    title=title,
+                    kind="other" if command == "vague" else kind,
+                    status="pending",
+                    locations=location,
                 ),
                 options=list(OPTIONS),
             )
@@ -235,6 +257,10 @@ class FakeAgent(Agent):
 
         if command == "mode":
             await self._say(session_id, f"mode {self._modes.get(session_id, 'none')}")
+            return PromptResponse(stop_reason="end_turn")
+
+        if command == "model":
+            await self._say(session_id, f"model {self._models.get(session_id, 'none')}")
             return PromptResponse(stop_reason="end_turn")
 
         if command == "usage":
