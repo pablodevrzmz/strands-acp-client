@@ -519,6 +519,7 @@ def test_with_env_and_the_codex_preset():
     kilo = KNOWN_AGENTS["kilo"]
     assert kilo.modes == {"read_only": "ask", "deny_all": "ask"}
     assert kilo.config == {"model": "kilo/kilo-auto/free"}, "the default model needs an account; this one does not"
+    assert kilo.sandboxed_kinds == ("execute",), "in ask mode Kilo filters shell commands itself"
 
 
 # ── session options over ACP: what Kilo needed to run on a free model ──

@@ -169,6 +169,26 @@ its free router, `kilo/kilo-auto/free`, which does not. An option or a value the
 is an error that lists the choices, so a misspelled model never falls back silently to a default you
 may be paying for. The options in effect are reported as `config` in the result.
 
+Kilo's free router comes with an anonymous allowance. Once it is used up, Kilo answers with a request
+to sign up (free) or come back later, which the tool reports as an error quoting that message. To run
+Kilo on a local model instead, declare the provider in Kilo's own `kilo.json` and select it the same way:
+
+```json
+{
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://localhost:11434/v1" },
+      "models": { "qwen3.8:27b": {} }
+    }
+  }
+}
+```
+
+```python
+local_kilo = KNOWN_AGENTS["kilo"].with_config(model="ollama/qwen3.8:27b")
+```
+
 ## Permissions
 
 Under ACP the client owns permissions: when the coding agent wants to do something its own rules
@@ -218,7 +238,7 @@ permission request. So the tool does two more things under every policy except `
 | `claude` | your Claude Code settings, often `auto` | switched to `default` ("always ask before making changes") | the agent asks, the policy refuses |
 | `codex` | `agent`, where it runs and edits on its own | switched to `read-only` | its sandbox lets commands read; it asks before any change and the policy refuses |
 | `qwen` | `auto`, where a classifier decides | switched to `default` | the agent asks, the policy refuses |
-| `kilo` | `code`, which edits and runs commands unasked | switched to `ask` for `read_only` and `deny_all` | the agent declines on its own |
+| `kilo` | `code`, which edits and runs commands unasked | switched to `ask` for `read_only` and `deny_all` | the agent declines on its own, and its shell policy blocks commands that write |
 | `opencode` | `build` | switched to `plan` for `read_only` and `deny_all` | the agent declines on its own |
 | `strands` | every built-in tool, nobody asked | started with `--builtin-tools read,web_fetch` for `read_only` and `deny_all` | the agent has no tool to edit with |
 | others | their own default | nothing known yet | reported by `strict` if they do not ask |
@@ -233,7 +253,8 @@ AgentCommand(("my-agent", "--acp"), "my agent", policy_args={"read_only": ("--no
 Two more fields cover what Codex needed. `auth_method` names the ACP authentication method to run when
 the agent answers "authentication required". `sandboxed_kinds` lists tool kinds the agent confines by
 itself once its restricted mode is active: Codex reads files with shell commands inside an
-operating-system sandbox, so an unasked `execute` is expected there and is not treated as a violation.
+operating-system sandbox, and Kilo's `ask` mode filters shell commands through its own allowlist, so an
+unasked `execute` is expected there and is not treated as a violation.
 
 OpenCode, Kilo and the Strands CLI (0.2.x) have no way to consult a custom handler: OpenCode's `build`
 mode, Kilo's `code` mode and the Strands CLI's stock tools act without asking, and `strict` reports
@@ -323,7 +344,8 @@ the bug without touching the file, it fixes it under `allow_all`, the edit does 
 `read_only`, a custom handler is either consulted or the unasked change is reported as a violation,
 and a second task with the returned `session_id` remembers the first. Claude Code 2.1 (adapter 0.101),
 OpenCode 1.18 and Kilo 7.8 pass all five, and so do Codex (adapter 2.6), Qwen Code 0.27 and the Strands
-CLI 0.2.4 on a local Ollama model. Kilo and those three need no account and no key:
+CLI 0.2.4 on a local Ollama model. Kilo was verified both on its free router and on local Ollama;
+it and those three need no account and no key:
 
 ```bash
 ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
