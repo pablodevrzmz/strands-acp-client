@@ -4,13 +4,15 @@ These tests cost model tokens and need the agents logged in, so they never run b
 Select the agents with ``ACP_E2E_AGENTS``: known names from ``KNOWN_AGENTS``, ``name+extra args`` for a
 known agent with more flags, or ``name=argv`` for any command:
 
-    ACP_E2E_AGENTS=claude,opencode hatch run test tests/e2e -v -s
+    ACP_E2E_AGENTS=claude,opencode,kilo hatch run test tests/e2e -v -s
     ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
     ACP_E2E_AGENTS='qwen+--auth-type openai --openai-base-url http://localhost:11434/v1 --openai-api-key ollama
         -m qwen3.8:27b' hatch run test tests/e2e -v -s
     MODEL_PROVIDER=ollama CODEX_CONFIG='{"model": "qwen3.8:27b"}' ACP_E2E_AGENTS=codex hatch run test tests/e2e -v -s
 
 An agent that takes its provider from the environment (Codex) simply inherits it from this process.
+``ACP_E2E_CONFIG`` sets session options on every selected agent, e.g. ``ACP_E2E_CONFIG=model=ollama/qwen3.8:27b``
+to run Kilo on a local model declared in its ``kilo.json``.
 
 Each scenario works in a fresh temporary directory holding a tiny Python file with an obvious bug,
 so the agent has something concrete to read, explain and fix.
@@ -54,6 +56,9 @@ def _selected_agents() -> dict[str, AgentCommand]:
         else:
             name, _, extra = item.partition("+")
             agents[name] = KNOWN_AGENTS[name].with_args(*shlex.split(extra))
+    options = dict(pair.split("=", 1) for pair in os.environ.get("ACP_E2E_CONFIG", "").split(",") if "=" in pair)
+    if options:
+        agents = {name: command.with_config(**options) for name, command in agents.items()}
     return agents
 
 
@@ -169,6 +174,7 @@ async def test_read_only_refuses_the_edit(make_real_tool, run_tool, workdir, age
     )
     _print(f"{agent_name} read_only edit attempt", result)
     details = result_json(result)
+    assert details["stop_reason"] != "error", "the agent must actually have run: " + result_text(result)
     assert (workdir / "calc.py").read_text() == CALC, "the edit must have been refused"
     # Either the agent asked and was refused, or its read-only mode kept it from trying.
     assert details["permissions"]["allowed"] == 0
@@ -209,6 +215,7 @@ async def test_custom_handler_is_never_bypassed_silently(make_real_tool, run_too
     _print(f"{agent_name} custom handler", result)
     details = result_json(result)
     print("  handler was asked about:", asked)
+    assert details["stop_reason"] != "error", "the agent must actually have run: " + result_text(result)
     if (workdir / "calc.py").read_text() != CALC:
         # The agent changed the file without consulting the handler: that must surface as an error.
         assert result["status"] == "error", "an unasked change must not be reported as success"

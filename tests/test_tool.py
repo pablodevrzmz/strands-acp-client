@@ -40,7 +40,7 @@ def test_agents_argument_shapes(tmp_path):
     custom = make_acp_agent(agents={"mine": AgentCommand(("my-agent", "--acp"), "my agent")}, cwd=tmp_path)
     assert "mine (my agent)" in custom.tool_spec["description"]
     # Presets exist only for agents the end-to-end suite has driven for real.
-    assert set(KNOWN_AGENTS) == {"claude", "codex", "opencode", "qwen", "strands"}
+    assert set(KNOWN_AGENTS) == {"claude", "codex", "kilo", "opencode", "qwen", "strands"}
     with pytest.raises(ValueError, match="Pass argv explicitly"):
         make_acp_agent(agents=["gemini"], cwd=tmp_path)
     unverified = make_acp_agent(agents={"gemini": ["npx", "-y", "@google/gemini-cli", "--acp"]}, cwd=tmp_path)
@@ -515,3 +515,76 @@ def test_with_env_and_the_codex_preset():
     assert local.env == {"NO_BROWSER": None, "MODEL_PROVIDER": "ollama"}
     assert local.argv == codex.argv and local.modes == codex.modes and local.auth_method == "api-key"
     assert codex.env == {"NO_BROWSER": "1"}, "with_env must not change the original"
+
+    kilo = KNOWN_AGENTS["kilo"]
+    assert kilo.modes == {"read_only": "ask", "deny_all": "ask"}
+    assert kilo.config == {"model": "kilo/kilo-auto/free"}, "the default model needs an account; this one does not"
+    assert kilo.sandboxed_kinds == ("execute",), "in ask mode Kilo filters shell commands itself"
+
+
+# ── session options over ACP: what Kilo needed to run on a free model ──
+
+
+async def test_session_options_are_set_and_reported(make_tool, run_tool):
+    command = AgentCommand(FAKE_ARGV, "fake", config={"model": "small-free"})
+    built = make_tool(agents={"fake": command}, env={"FAKE_ACP_CONFIG_MODELS": "big-paid,small-free"})
+    _, result = await run_tool(built, task="model")
+    assert result_text(result) == "model small-free"
+    assert result_json(result)["config"] == {"model": "small-free"}
+
+    untouched = make_tool(env={"FAKE_ACP_CONFIG_MODELS": "big-paid,small-free"})
+    _, default = await run_tool(untouched, task="model")
+    assert result_text(default) == "model big-paid"
+    assert "config" not in result_json(default)
+
+
+async def test_an_option_or_value_the_agent_does_not_offer_is_an_error(make_tool, run_tool):
+    env = {"FAKE_ACP_CONFIG_MODELS": "big-paid,small-free"}
+    typo = make_tool(agents={"fake": AgentCommand(FAKE_ARGV, "fake", config={"model": "smal-free"})}, env=env)
+    _, result = await run_tool(typo, task="model")
+    assert result["status"] == "error"
+    assert "does not offer 'smal-free' for 'model'; choices: big-paid, small-free" in result_text(result)
+    assert len(typo.acp_sessions) == 0, "a session that could not be configured is not kept"
+
+    unknown = make_tool(agents={"fake": AgentCommand(FAKE_ARGV, "fake", config={"effort": "high"})}, env=env)
+    _, result = await run_tool(unknown, task="model")
+    assert result["status"] == "error"
+    assert "has no session option 'effort'; it offers: model" in result_text(result)
+
+
+def test_with_config_adds_options_and_keeps_what_is_known():
+    base = AgentCommand(FAKE_ARGV, "fake", modes={"read_only": "ask"}, config={"model": "a"})
+    tuned = base.with_config(model="b", effort="low")
+    assert tuned.config == {"model": "b", "effort": "low"}
+    assert tuned.modes == base.modes and tuned.argv == base.argv
+    assert base.config == {"model": "a"}
+
+
+async def test_a_vague_permission_request_is_judged_by_the_calls_known_kind(make_tool, run_tool):
+    seen = []
+
+    def handler(request):
+        seen.append(request.kind)
+        return request.kind == "read"
+
+    built = make_tool(permissions=handler)
+    _, read = await run_tool(built, task="vague read")
+    assert "permission allowed" in result_text(read)
+    _, edit = await run_tool(built, task="vague edit")
+    assert "permission denied" in result_text(edit)
+    assert seen == ["read", "edit"], "the request said 'other'; the tool call had already said what it was"
+
+    # read_only follows the same rule: a search or read announced earlier is allowed, an edit is not.
+    _, allowed = await run_tool(make_tool(), task="vague search")
+    assert "permission allowed" in result_text(allowed)
+
+
+async def test_the_working_directory_is_resolved_to_its_real_path(make_tool, run_tool, tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    _, result = await run_tool(make_tool(cwd=link), task="note")
+    assert result_text(result) == f"Working directory: {os.path.realpath(real)}"
+    _, per_call = await run_tool(make_tool(), task="note", cwd=str(link))
+    assert result_text(per_call) == f"Working directory: {os.path.realpath(real)}"
