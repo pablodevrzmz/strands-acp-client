@@ -58,6 +58,12 @@ def test_factory_rejects_bad_arguments(tmp_path):
         make_acp_agent(agents=["not-a-known-agent"], cwd=tmp_path)
     with pytest.raises(ValueError):
         make_acp_agent(agents={"fake": FAKE_ARGV}, cwd=tmp_path / "missing")
+    with pytest.raises(ValueError):
+        make_acp_agent(agents={"fake": FAKE_ARGV}, cwd=tmp_path, startup_timeout=0)
+    with pytest.raises(ValueError):
+        make_acp_agent(agents={"fake": FAKE_ARGV}, cwd=tmp_path, cancel_grace=-1)
+    with pytest.raises(ValueError):
+        make_acp_agent(agents={"fake": FAKE_ARGV}, cwd=tmp_path, max_sessions=0)
 
 
 async def test_echo_returns_text_and_metadata(make_tool, run_tool):
@@ -187,8 +193,12 @@ async def test_timeout_cancels_a_slow_turn(make_tool, run_tool):
     assert result["status"] == "error"
     assert "did not finish within 0s" in result_text(result) or "did not finish within 1s" in result_text(result)
     assert "working..." in result_text(result)
-    assert result_json(result)["stop_reason"] == "timeout"
-    assert len(built.acp_sessions) == 0
+    details = result_json(result)
+    assert details["stop_reason"] == "timeout"
+    # The agent honoured the cancellation, so its session is still there to be continued.
+    assert built.acp_sessions.session_ids == [details["session_id"]]
+    _, after = await run_tool(built, task="turn", session_id=details["session_id"])
+    assert result_text(after) == "turn 2"
 
 
 async def test_cancel_signal_stops_the_turn(make_tool, run_tool, monkeypatch):
@@ -229,10 +239,13 @@ async def test_agent_errors_are_quoted(make_tool, run_tool):
     _, auth = await run_tool(built, task="fail")
     assert auth["status"] == "error"
     assert "requires authentication: Authentication required" in result_text(auth)
-    _, internal = await run_tool(built, task="error")
+    # An agent that answers with an error is still there to talk to: the session carries on.
+    _, internal = await run_tool(built, task="error", session_id=result_json(auth)["session_id"])
     assert internal["status"] == "error"
     assert "returned an error (code -32603)" in result_text(internal)
-    assert len(built.acp_sessions) == 0
+    assert len(built.acp_sessions) == 1
+    _, after = await run_tool(built, task="turn", session_id=result_json(internal)["session_id"])
+    assert result_text(after) == "turn 3"
 
 
 async def test_protocol_version_mismatch_is_reported(make_tool, run_tool):

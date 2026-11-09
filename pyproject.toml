@@ -80,6 +80,10 @@ select = [
     "B",  # flake8-bugbear
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# The scripted agent announces itself before its slower imports; see the top of the file.
+"tests/fake_acp_agent.py" = ["E402"]
+
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true

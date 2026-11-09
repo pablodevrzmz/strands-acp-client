@@ -1,4 +1,4 @@
-"""Agent processes, ACP sessions and the registry that keeps them alive between tool calls."""
+"""One agent process holding one ACP session, and what a single prompt to it produces."""
 
 from __future__ import annotations
 
@@ -6,21 +6,26 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 import time
-from collections.abc import AsyncIterator, Mapping
-from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from acp import PROTOCOL_VERSION, RequestError, spawn_agent_process
+from acp import PROTOCOL_VERSION, RequestError, connect_to_agent
 from acp.schema import ClientCapabilities, Implementation, TextContentBlock
 
 from strands_acp_client._agents import AgentCommand
 from strands_acp_client._client import StrandsAcpClient, Turn
 from strands_acp_client._permissions import PermissionPolicy, policy_label
+from strands_acp_client._process import AgentProcess
+from strands_acp_client._runtime import CallCancelled, unless_cancelled
 
-__all__ = ["AcpAgentError", "AcpSession", "SessionRegistry", "TurnResult"]
+if TYPE_CHECKING:
+    from acp.client.connection import ClientSideConnection
+
+__all__ = ["AcpAgentError", "AcpSession", "SessionSpec", "TurnResult"]
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +36,8 @@ except PackageNotFoundError:  # pragma: no cover - source checkout without metad
 
 _CLIENT_INFO = Implementation(name="strands-acp-client", title="Strands ACP client tool", version=_VERSION)
 _AUTH_REQUIRED = -32000
+_POLL = 0.25
+"""Seconds between two looks at the clock and at the caller's cancellation signal during a turn."""
 
 
 class _VendorNotificationFilter(logging.Filter):
@@ -67,137 +74,165 @@ class AcpAgentError(Exception):
     """The agent could not be started, resumed or driven through a turn."""
 
 
+@dataclass(frozen=True)
+class SessionSpec:
+    """What it takes to start one agent process and open a session in it."""
+
+    agent_name: str
+    command: AgentCommand
+    cwd: str
+    policy: PermissionPolicy
+    env: Mapping[str, str | None] | None = None
+    strict: bool = True
+    cancel_grace: float = 10.0
+    startup_timeout: float = 120.0
+
+
 @dataclass
 class TurnResult:
     """Outcome of one prompt, ready to be turned into a tool result."""
 
     text: str
     stop_reason: str
-    usage: dict[str, Any] | None
-    tool_calls: list[dict[str, Any]]
-    allowed: int
-    denied: int
-    thought_chars: int
-    elapsed: float
+    usage: dict[str, Any] | None = None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    allowed: int = 0
+    denied: int = 0
+    thought_chars: int = 0
+    elapsed: float = 0.0
     error: str | None = None
     violation: dict[str, Any] | None = None
     refused: tuple[str, ...] = ()
+    stderr: str = ""
 
 
 class AcpSession:
-    """One agent subprocess holding one ACP session."""
+    """One agent subprocess holding one ACP session.
 
-    def __init__(
-        self,
-        agent_name: str,
-        command: AgentCommand,
-        cwd: str,
-        policy: PermissionPolicy,
-        env: Mapping[str, str | None] | None = None,
-        cancel_grace: float = 10.0,
-        strict: bool = True,
-    ) -> None:
-        self.agent_name = agent_name
-        self.command = command
-        self.cwd = cwd
-        self.cancel_grace = cancel_grace
-        self.policy_label = policy_label(policy)
-        self.client = StrandsAcpClient(agent_name, policy, strict=strict)
+    Everything here runs on the tool's own event loop (see ``Runtime``), whichever loop the tool
+    call came from.
+    """
+
+    def __init__(self, spec: SessionSpec) -> None:
+        self.spec = spec
+        self.agent_name = spec.agent_name
+        self.command = spec.command
+        self.cwd = spec.cwd
+        self.policy_label = policy_label(spec.policy)
+        self.client = StrandsAcpClient(spec.agent_name, spec.policy, strict=spec.strict)
         self.session_id: str = ""
         self.mode: str | None = None
         self.config: dict[str, str] = {}
         self.resumed = False
         self.agent_info: dict[str, Any] | None = None
         self.supports_load = False
-        self.loop: asyncio.AbstractEventLoop | None = None
         self.last_used = time.monotonic()
-        self._env = env
-        self._stack: AsyncExitStack | None = None
-        self._conn: Any = None
-        self._proc: Any = None
-        self._lock: asyncio.Lock | None = None
+        # Kept by the registry: how many tool calls hold this session, and whether it is to be
+        # closed once the last of them lets go.
+        self.leases = 0
+        self.retired = False
+        self._conn: ClientSideConnection | None = None
+        self._process: AgentProcess | None = None
+        self._lock = asyncio.Lock()
+        self._closing: asyncio.Future[None] | None = None
         self._closed = False
 
     # ── lifecycle ──
 
     async def start(self, session_id: str | None = None) -> None:
-        """Spawn the agent, negotiate ACP v1 and open (or resume) a session."""
+        """Spawn the agent, negotiate ACP v1 and open (or resume) a session.
+
+        All of it has ``startup_timeout`` seconds. An agent that never answers, because it is
+        waiting for a login in a browser or is still downloading itself, is stopped and reported
+        instead of holding the tool call for ever.
+        """
         _quiet_vendor_notifications()
-        self.loop = asyncio.get_running_loop()
-        self._lock = asyncio.Lock()
+        try:
+            await asyncio.wait_for(self._start(session_id), self.spec.startup_timeout)
+        except asyncio.TimeoutError:
+            waited = f"did not finish starting within {self.spec.startup_timeout:g}s"
+            message = await self._with_last_words(f"agent {self.agent_name!r} {waited}", wait=0)
+            await self.close()
+            raise AcpAgentError(message) from None
+        except AcpAgentError:
+            await self.close()
+            raise
+        except Exception as exc:
+            message = await self._with_last_words(f"agent {self.agent_name!r} failed during setup: {exc}")
+            await self.close()
+            raise AcpAgentError(message) from exc
+        except BaseException:  # cancelled half way: the process must not outlive the call that wanted it
+            await self.close()
+            raise
+
+    async def _start(self, session_id: str | None) -> None:
+        argv = self.command.argv_for(self.policy_label)
+        try:
+            self._process = await AgentProcess.spawn(argv, cwd=self.cwd, env=self._environment(), label=self.agent_name)
+        except FileNotFoundError:
+            if not os.path.isdir(self.cwd):
+                raise AcpAgentError(
+                    f"cannot start agent {self.agent_name!r}: {self.cwd!r} is not a directory"
+                ) from None
+            raise AcpAgentError(f"cannot start agent {self.agent_name!r}: {argv[0]!r} was not found on PATH") from None
+        except OSError as exc:
+            raise AcpAgentError(f"cannot start agent {self.agent_name!r}: {exc}") from exc
+        self._conn = conn = connect_to_agent(self.client, self._process.stdin, self._process.stdout)
+
+        init = await conn.initialize(
+            protocol_version=PROTOCOL_VERSION,
+            client_capabilities=ClientCapabilities(),
+            client_info=_CLIENT_INFO,
+        )
+        if init.protocol_version != PROTOCOL_VERSION:
+            raise AcpAgentError(
+                f"agent {self.agent_name!r} answered with ACP protocol version {init.protocol_version}; "
+                f"this client speaks version {PROTOCOL_VERSION}"
+            )
+        if init.agent_info is not None:
+            self.agent_info = {"name": init.agent_info.name, "version": init.agent_info.version}
+        self.supports_load = bool(init.agent_capabilities and init.agent_capabilities.load_session)
+
+        if session_id is not None and not self.supports_load:
+            raise AcpAgentError(
+                f"session {session_id!r} is not held by this process and agent {self.agent_name!r} "
+                "cannot resume sessions; start a new one"
+            )
+        try:
+            opened = await self._open(conn, session_id)
+        except RequestError as exc:
+            if exc.code != _AUTH_REQUIRED:
+                raise
+            await self._authenticate(conn, init.auth_methods or [])
+            opened = await self._open(conn, session_id)
+        await self._select_mode(conn, opened)
+        await self._apply_config(conn, opened)
+        if self.mode is not None:
+            # The agent is in the mode where it confines these kinds itself; see AgentCommand.
+            self.client.exempt_kinds = frozenset(self.command.sandboxed_kinds)
+
+    def _environment(self) -> dict[str, str]:
+        """This process's environment with the agent's and the tool's changes applied, in that order."""
         env = dict(os.environ)
-        for changes in (self.command.env, self._env):
+        for changes in (self.command.env, self.spec.env):
             for key, value in (changes or {}).items():
                 if value is None:
                     env.pop(key, None)
                 else:
                     env[key] = value
+        return env
 
-        stack = AsyncExitStack()
-        try:
-            self._conn, self._proc = await stack.enter_async_context(
-                spawn_agent_process(self.client, *self.command.argv_for(self.policy_label), cwd=self.cwd, env=env)
-            )
-        except FileNotFoundError:
-            await stack.aclose()
-            raise AcpAgentError(
-                f"cannot start agent {self.agent_name!r}: {self.command.argv[0]!r} was not found on PATH"
-            ) from None
-        except Exception as exc:
-            await stack.aclose()
-            raise AcpAgentError(f"cannot start agent {self.agent_name!r}: {exc}") from exc
-        self._stack = stack
-
-        try:
-            init = await self._conn.initialize(
-                protocol_version=PROTOCOL_VERSION,
-                client_capabilities=ClientCapabilities(),
-                client_info=_CLIENT_INFO,
-            )
-            if init.protocol_version != PROTOCOL_VERSION:
-                raise AcpAgentError(
-                    f"agent {self.agent_name!r} answered with ACP protocol version {init.protocol_version}; "
-                    f"this client speaks version {PROTOCOL_VERSION}"
-                )
-            if init.agent_info is not None:
-                self.agent_info = {"name": init.agent_info.name, "version": init.agent_info.version}
-            self.supports_load = bool(init.agent_capabilities and init.agent_capabilities.load_session)
-
-            if session_id is not None and not self.supports_load:
-                raise AcpAgentError(
-                    f"session {session_id!r} is not held by this process and agent {self.agent_name!r} "
-                    "cannot resume sessions; start a new one"
-                )
-            try:
-                opened = await self._open(session_id)
-            except RequestError as exc:
-                if exc.code != _AUTH_REQUIRED:
-                    raise
-                await self._authenticate(init.auth_methods or [])
-                opened = await self._open(session_id)
-            await self._select_mode(opened)
-            await self._apply_config(opened)
-            if self.mode is not None:
-                # The agent is in the mode where it confines these kinds itself; see AgentCommand.
-                self.client.exempt_kinds = frozenset(self.command.sandboxed_kinds)
-        except AcpAgentError:
-            await self.close()
-            raise
-        except Exception as exc:
-            await self.close()
-            raise AcpAgentError(f"agent {self.agent_name!r} failed during setup: {exc}") from exc
-
-    async def _open(self, session_id: str | None) -> Any:
+    async def _open(self, conn: ClientSideConnection, session_id: str | None) -> Any:
         if session_id is None:
-            opened = await self._conn.new_session(cwd=self.cwd, mcp_servers=[])
-            self.session_id = opened.session_id
-            return opened
-        opened = await self._conn.load_session(cwd=self.cwd, session_id=session_id, mcp_servers=[])
+            created = await conn.new_session(cwd=self.cwd, mcp_servers=[])
+            self.session_id = created.session_id
+            return created
+        loaded = await conn.load_session(cwd=self.cwd, session_id=session_id, mcp_servers=[])
         self.session_id = session_id
         self.resumed = True
-        return opened
+        return loaded
 
-    async def _authenticate(self, offered: list[Any]) -> None:
+    async def _authenticate(self, conn: ClientSideConnection, offered: list[Any]) -> None:
         """Run the ACP authentication step with the method configured for this agent."""
         ids = [str(method.id) for method in offered]
         method = self.command.auth_method
@@ -211,9 +246,9 @@ class AcpSession:
                 f"agent {self.agent_name!r} requires authentication but does not offer the configured method "
                 f"{method!r}; it offers: {', '.join(ids) or 'none'}"
             )
-        await self._conn.authenticate(method_id=method)
+        await conn.authenticate(method_id=method)
 
-    async def _select_mode(self, opened: Any) -> None:
+    async def _select_mode(self, conn: ClientSideConnection, opened: Any) -> None:
         """Switch the session to the mode this agent needs for the current policy, if it offers it."""
         wanted = (self.command.modes or {}).get(self.policy_label)
         if not wanted or opened is None:
@@ -221,18 +256,18 @@ class AcpSession:
         modes = getattr(opened, "modes", None)
         if modes is not None and any(mode.id == wanted for mode in modes.available_modes):
             if modes.current_mode_id != wanted:
-                await self._conn.set_session_mode(session_id=self.session_id, mode_id=wanted)
+                await conn.set_session_mode(session_id=self.session_id, mode_id=wanted)
             self.mode = wanted
             return
         for option in getattr(opened, "config_options", None) or []:
             if getattr(option, "id", None) == "mode" and wanted in _select_values(option):
                 if getattr(option, "current_value", None) != wanted:
-                    await self._conn.set_config_option(config_id="mode", session_id=self.session_id, value=wanted)
+                    await conn.set_config_option(config_id="mode", session_id=self.session_id, value=wanted)
                 self.mode = wanted
                 return
         logger.info("agent %r does not offer mode %r; relying on its own defaults", self.agent_name, wanted)
 
-    async def _apply_config(self, opened: Any) -> None:
+    async def _apply_config(self, conn: ClientSideConnection, opened: Any) -> None:
         """Set the session options configured for this agent (its model, for instance)."""
         wanted = self.command.config or {}
         if not wanted:
@@ -252,38 +287,50 @@ class AcpSession:
                     f"agent {self.agent_name!r} does not offer {value!r} for {option_id!r}; choices: {shown}"
                 )
             if getattr(option, "current_value", None) != value:
-                await self._conn.set_config_option(config_id=option_id, session_id=self.session_id, value=value)
+                await conn.set_config_option(config_id=option_id, session_id=self.session_id, value=value)
             self.config[option_id] = value
+
+    async def _with_last_words(self, message: str, wait: float = 1.0) -> str:
+        """Add to ``message`` how the process ended and what it last said on stderr, when that is known."""
+        if self._process is None:
+            return message
+        note, stderr = await self._process.last_words(wait)
+        if note:
+            message += f" ({note})"
+        if stderr:
+            message += f". Its last output on stderr:\n{stderr}"
+        return message
 
     @property
     def alive(self) -> bool:
-        return not self._closed and self._proc is not None and self._proc.returncode is None
-
-    @property
-    def busy(self) -> bool:
-        return self._lock is not None and self._lock.locked()
+        return not self._closed and self._process is not None and self._process.returncode is None
 
     def touch(self) -> None:
         self.last_used = time.monotonic()
 
     async def close(self) -> None:
-        """Close the connection and terminate the agent process."""
-        if self._closed:
-            return
-        self._closed = True
-        stack, self._stack = self._stack, None
-        if stack is not None:
+        """Close the connection and end the agent process.
+
+        Every caller waits for the same shutdown, and the shutdown carries on if a caller is
+        cancelled while waiting for it.
+        """
+        if self._closing is None:
+            self._closed = True
+            self._closing = asyncio.ensure_future(self._close())
+        await asyncio.shield(self._closing)
+
+    async def _close(self) -> None:
+        if self._conn is not None:
             with contextlib.suppress(Exception):
-                await stack.aclose()
-        self.kill()
+                await self._conn.close()
+        if self._process is not None:
+            await self._process.stop()
 
     def kill(self) -> None:
-        """Best-effort synchronous termination, for sessions bound to a loop that is gone."""
+        """End the agent process at once, without an event loop: the last resort when the loop is gone."""
         self._closed = True
-        proc = self._proc
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
+        if self._process is not None:
+            self._process.kill()
 
     # ── one turn ──
 
@@ -292,14 +339,28 @@ class AcpSession:
         text: str,
         *,
         timeout: float,
-        cancel_signal: Any = None,
-    ) -> AsyncIterator[dict[str, Any] | TurnResult]:
-        """Send one prompt and stream progress events; the last item yielded is the ``TurnResult``."""
-        if self._lock is None or self._conn is None:
+        cancel_signal: threading.Event | None = None,
+        home: asyncio.AbstractEventLoop | None = None,
+    ) -> AsyncGenerator[dict[str, Any] | TurnResult, None]:
+        """Send one prompt and stream progress events; the last item yielded is the ``TurnResult``.
+
+        Turns on one session run one after another: a second call waits for the first to finish.
+        ``home`` is the event loop of the tool call, where a custom permission handler is run.
+        """
+        conn = self._conn
+        if conn is None:
             raise AcpAgentError("session was not started")
-        async with self._lock:
+        try:
+            await unless_cancelled(self._lock.acquire(), cancel_signal)
+        except CallCancelled:
+            yield TurnResult("", "cancelled", error="the task was cancelled by the caller before the agent started it")
+            return
+        try:
+            if not self.alive:
+                yield TurnResult("", "error", error="the session was closed before the agent could start the task")
+                return
             self.touch()
-            turn = Turn()
+            turn = Turn(home)
             self.client.turn = turn
             loop = asyncio.get_running_loop()
             started = loop.time()
@@ -307,79 +368,90 @@ class AcpSession:
             # The agent knows its working directory from session/new, but its model often does not:
             # one that cannot run ``pwd`` (a read-only toolset) has no way to turn the relative paths
             # in a task into the absolute ones its file tools want. So every task says where it is.
-            blocks = [TextContentBlock(text=text), TextContentBlock(text=f"Working directory: {self.cwd}")]
-            task = asyncio.ensure_future(self._conn.prompt(session_id=self.session_id, prompt=blocks))
-            cancel_reason: str | None = None
+            note = TextContentBlock(text=f"Working directory: {self.cwd}")
+            request: asyncio.Future[Any] = asyncio.ensure_future(
+                conn.prompt(session_id=self.session_id, prompt=[TextContentBlock(text=text), note])
+            )
+            pending: asyncio.Future[dict[str, Any]] | None = None
+            stopped: str | None = None
             try:
-                while not task.done():
+                while stopped is None:
+                    if pending is None:
+                        pending = asyncio.ensure_future(turn.events.get())
+                    wait = min(_POLL, max(deadline - loop.time(), 0.0))
+                    waiting: set[asyncio.Future[Any]] = {request, pending}
+                    done, _ = await asyncio.wait(waiting, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+                    if pending in done:
+                        event, pending = pending.result(), None
+                        yield event
                     if turn.violation is not None:
-                        cancel_reason = "policy_violation"
+                        stopped = "policy_violation"
+                    elif request.done():
                         break
-                    if cancel_signal is not None and cancel_signal.is_set():
-                        cancel_reason = "cancelled"
-                        break
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        cancel_reason = "timeout"
-                        break
-                    getter = asyncio.ensure_future(turn.events.get())
-                    done, _ = await asyncio.wait(
-                        {task, getter}, timeout=min(0.25, remaining), return_when=asyncio.FIRST_COMPLETED
-                    )
-                    if getter in done:
-                        yield getter.result()
+                    elif cancel_signal is not None and cancel_signal.is_set():
+                        stopped = "cancelled"
+                    elif loop.time() >= deadline:
+                        stopped = "timeout"
+                if stopped is not None and not request.done():
+                    await self._cancel_turn(conn, request)
+                if pending is not None:
+                    # A waiter that is cancelled before it wakes up leaves its event in the queue.
+                    if pending.done() and not pending.cancelled():
+                        yield pending.result()
                     else:
-                        getter.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await getter
-                if cancel_reason is None and turn.violation is not None:
-                    cancel_reason = "policy_violation"
-                if cancel_reason is not None and not task.done():
-                    await self._cancel_turn(task)
+                        pending.cancel()
+                    pending = None
                 while not turn.events.empty():
                     yield turn.events.get_nowait()
-                yield self._finish(turn, task, cancel_reason, loop.time() - started, timeout)
+                yield await self._finish(turn, request, stopped, loop.time() - started, timeout)
             finally:
-                if not task.done():
-                    # The consumer stopped listening (an error upstream, or the agent loop was torn down):
+                if pending is not None:
+                    pending.cancel()
+                if not request.done():
+                    # The consumer stopped listening (an error upstream, or the call was cancelled):
                     # do not leave the coding agent working for nobody.
-                    await self._cancel_turn(task)
+                    await self._cancel_turn(conn, request)
                 self.client.turn = None
                 self.touch()
+        finally:
+            self._lock.release()
 
-    async def _cancel_turn(self, task: asyncio.Future[Any]) -> None:
-        """Ask the agent to stop, give it a grace period, then kill the process if it ignores us."""
+    async def _cancel_turn(self, conn: ClientSideConnection, request: asyncio.Future[Any]) -> None:
+        """Ask the agent to stop, give it a grace period, then end the process if it ignores us."""
         with contextlib.suppress(Exception):
-            await self._conn.cancel(session_id=self.session_id)
-        done, _ = await asyncio.wait({task}, timeout=self.cancel_grace)
-        if task not in done:
-            logger.warning("agent %r ignored session/cancel for %.0fs; killing it", self.agent_name, self.cancel_grace)
-            task.cancel()
+            await conn.cancel(session_id=self.session_id)
+        done, _ = await asyncio.wait({request}, timeout=self.spec.cancel_grace)
+        if request not in done:
+            logger.warning(
+                "agent %r ignored session/cancel for %gs; ending its process", self.agent_name, self.spec.cancel_grace
+            )
+            request.cancel()
             with contextlib.suppress(BaseException):
-                await task
+                await request
             await self.close()
 
-    def _finish(
-        self, turn: Turn, task: asyncio.Future[Any], cancel_reason: str | None, elapsed: float, timeout: float
+    async def _finish(
+        self, turn: Turn, request: asyncio.Future[Any], stopped: str | None, elapsed: float, timeout: float
     ) -> TurnResult:
         usage: dict[str, Any] | None = None
         error: str | None = None
+        stderr = ""
         stop_reason = "error"
-        finished = task.done() and not task.cancelled() and task.exception() is None
+        finished = request.done() and not request.cancelled() and request.exception() is None
         if finished:
-            response = task.result()
+            response = request.result()
             stop_reason = str(response.stop_reason)
             if response.usage is not None:
                 usage = response.usage.model_dump(exclude_none=True, by_alias=False)
 
-        if cancel_reason == "timeout":
+        if stopped == "timeout":
             stop_reason = "timeout"
-            reaction = "was cancelled" if finished else "did not react to cancellation"
+            reaction = "was cancelled" if finished else "did not react to cancellation, so its process was ended"
             error = f"the agent did not finish within {timeout:.0f}s and {reaction}"
-        elif cancel_reason == "cancelled":
+        elif stopped == "cancelled":
             stop_reason = "cancelled"
             error = "the task was cancelled by the caller"
-        elif cancel_reason == "policy_violation":
+        elif stopped == "policy_violation":
             stop_reason = "policy_violation"
             violation = turn.violation or {}
             error = (
@@ -388,8 +460,18 @@ class AcpSession:
                 "stopped; that change may already have been made"
             )
         elif not finished:
-            exc = task.exception() if task.done() and not task.cancelled() else None
-            error = _describe_failure(exc)
+            exc = request.exception() if request.done() and not request.cancelled() else None
+            if isinstance(exc, RequestError):
+                error = _describe_failure(exc)
+            elif self._closed:
+                error = "the session was closed while the agent was working"
+            else:
+                # No answer and no error from the agent: its end of the pipe closed. Say how it died.
+                error = _describe_failure(exc)
+                if self._process is not None:
+                    note, stderr = await self._process.last_words()
+                    if note:
+                        error += f" ({note})"
         return TurnResult(
             text=turn.text,
             stop_reason=stop_reason,
@@ -402,6 +484,7 @@ class AcpSession:
             error=error,
             violation=turn.violation,
             refused=tuple(turn.refused),
+            stderr=stderr,
         )
 
 
@@ -426,78 +509,3 @@ def _describe_failure(exc: BaseException | None) -> str:
             return f"the agent requires authentication: {exc}"
         return f"the agent returned an error (code {exc.code}): {exc}"
     return f"the agent failed mid-turn: {exc}"
-
-
-class SessionRegistry:
-    """Live sessions of one tool, keyed by ACP session id.
-
-    Sessions are bound to the event loop that created them. A session created in an
-    earlier ``agent()`` call (Strands runs each synchronous call on its own loop) cannot
-    be driven from a new loop: it is dropped, and the agent is asked to resume the session
-    by id when it supports ``session/load``.
-    """
-
-    def __init__(self, max_sessions: int = 8) -> None:
-        if max_sessions < 1:
-            raise ValueError("max_sessions must be at least 1")
-        self.max_sessions = max_sessions
-        self._sessions: dict[str, AcpSession] = {}
-
-    def __len__(self) -> int:
-        return len(self._sessions)
-
-    @property
-    def session_ids(self) -> list[str]:
-        return list(self._sessions)
-
-    async def acquire(
-        self,
-        agent_name: str,
-        command: AgentCommand,
-        cwd: str,
-        session_id: str | None,
-        policy: PermissionPolicy,
-        env: Mapping[str, str | None] | None,
-        cancel_grace: float,
-        strict: bool = True,
-    ) -> AcpSession:
-        loop = asyncio.get_running_loop()
-        if session_id is not None:
-            held = self._sessions.get(session_id)
-            if held is not None:
-                if held.loop is loop and held.alive and held.agent_name == agent_name:
-                    held.touch()
-                    return held
-                await self._drop(held)
-        session = AcpSession(agent_name, command, cwd, policy, env=env, cancel_grace=cancel_grace, strict=strict)
-        await session.start(session_id=session_id)
-        self._sessions[session.session_id] = session
-        await self._evict()
-        return session
-
-    async def release(self, session: AcpSession, keep: bool) -> None:
-        if not keep or not session.alive:
-            await self._drop(session)
-
-    async def close(self, session_id: str) -> None:
-        session = self._sessions.get(session_id)
-        if session is not None:
-            await self._drop(session)
-
-    async def close_all(self) -> None:
-        for session in list(self._sessions.values()):
-            await self._drop(session)
-
-    async def _drop(self, session: AcpSession) -> None:
-        self._sessions.pop(session.session_id, None)
-        if session.loop is asyncio.get_running_loop():
-            await session.close()
-        else:
-            session.kill()
-
-    async def _evict(self) -> None:
-        while len(self._sessions) > self.max_sessions:
-            idle = [s for s in self._sessions.values() if not s.busy]
-            if not idle:
-                return
-            await self._drop(min(idle, key=lambda s: s.last_used))

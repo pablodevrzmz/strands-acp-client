@@ -7,12 +7,15 @@ Run with ``python tests/fake_acp_agent.py``. The first word of each prompt picks
 - ``toolstop <kind>``: like ``tool``, but end the turn as ``cancelled`` with no message when refused
 - ``sneak <kind> [seconds]``: complete a tool call of that kind without asking, then wait to see if anyone objects
 - ``slow <seconds>``: keep the turn open until cancelled or the time elapses
+- ``stubborn <seconds>``: keep the turn open for that long and ignore ``session/cancel``
+- ``noisy <kib>``: write that many KiB to stderr, more than a pipe holds, then answer
+- ``big <kib>``: answer with a single message chunk of that many KiB, far longer than one buffered line
 - ``turn``: answer with the number of prompts seen in this session
 - ``mode``: answer with the session's current mode; ``model``: answer with its current model
 - ``usage``: answer with token usage attached
 - ``refuse``: end the turn with stop reason ``refusal``
 - ``fail``: answer with an "authentication required" error; ``error``: answer with an internal error
-- ``crash``: exit the process mid-turn
+- ``crash``: complain on stderr and exit the process mid-turn
 - ``env <NAME>``: answer with the value of that environment variable, or ``<unset>``
 - ``argv``: answer with the arguments the agent was started with
 - ``note``: answer with whatever came after the task in the prompt (the client adds the working directory)
@@ -24,13 +27,30 @@ advertises ``session/load`` and ``FAKE_ACP_LOADED_TURNS`` seeds the turn counter
 config option instead, and ``FAKE_ACP_MODE`` picks the starting one (the last listed by default).
 ``FAKE_ACP_CONFIG_MODELS=a,b`` offers a ``model`` config option starting at the first one.
 ``FAKE_ACP_REQUIRE_AUTH=<method id>`` refuses sessions until the client authenticates with that method.
+
+For the process itself: ``FAKE_ACP_PID_FILE`` names a file that receives the process id, ``FAKE_ACP_STDERR``
+is a line written to stderr at startup, ``FAKE_ACP_EXIT=<code>`` exits with that code before speaking ACP at
+all, ``FAKE_ACP_HANG=initialize`` (or ``new_session``) never answers that request, ``FAKE_ACP_IGNORE_EOF=1``
+keeps the process running after its stdin closes and ``FAKE_ACP_IGNORE_TERM=1`` makes it ignore SIGTERM.
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
+
+# Before the imports below, which take a moment: a test that gives the agent a second to start
+# must find the process id and the stderr line already there.
+if __name__ == "__main__":
+    if os.environ.get("FAKE_ACP_PID_FILE"):
+        with open(os.environ["FAKE_ACP_PID_FILE"], "w") as _pid_file:
+            _pid_file.write(str(os.getpid()))
+    if os.environ.get("FAKE_ACP_STDERR"):
+        print(os.environ["FAKE_ACP_STDERR"], file=sys.stderr, flush=True)
+
+import asyncio
+import signal
+import time
 from typing import Any
 
 from acp import PROTOCOL_VERSION, Agent, RequestError, run_agent
@@ -94,6 +114,8 @@ class FakeAgent(Agent):
         return self._conn
 
     async def initialize(self, protocol_version: int, **kwargs: Any) -> InitializeResponse:
+        if os.environ.get("FAKE_ACP_HANG") == "initialize":
+            await asyncio.sleep(3600)
         version = int(os.environ.get("FAKE_ACP_PROTOCOL_VERSION", PROTOCOL_VERSION))
         load = os.environ.get("FAKE_ACP_LOAD_SESSION") == "1"
         return InitializeResponse(
@@ -114,6 +136,8 @@ class FakeAgent(Agent):
             raise RequestError.auth_required()
 
     async def new_session(self, cwd: str, **kwargs: Any) -> NewSessionResponse:
+        if os.environ.get("FAKE_ACP_HANG") == "new_session":
+            await asyncio.sleep(3600)
         self._require_auth()
         session_id = f"fake-{os.getpid()}-{self._next}"
         self._next += 1
@@ -251,6 +275,25 @@ class FakeAgent(Agent):
                 return PromptResponse(stop_reason="end_turn")
             return PromptResponse(stop_reason="cancelled")
 
+        if command == "stubborn":
+            await self._say(session_id, "not listening...")
+            await asyncio.sleep(float(words[1]) if len(words) > 1 else 5.0)
+            await self._say(session_id, "finished anyway")
+            return PromptResponse(stop_reason="end_turn")
+
+        if command == "noisy":
+            kib = int(words[1]) if len(words) > 1 else 256
+            line = "x" * 1023 + "\n"
+            for _ in range(kib):
+                sys.stderr.write(line)  # blocks for good once the pipe is full and nobody reads it
+            sys.stderr.flush()
+            await self._say(session_id, f"wrote {kib} KiB to stderr")
+            return PromptResponse(stop_reason="end_turn")
+
+        if command == "big":
+            await self._say(session_id, "y" * (int(words[1]) * 1024 if len(words) > 1 else 262144))
+            return PromptResponse(stop_reason="end_turn")
+
         if command == "turn":
             await self._say(session_id, f"turn {self._turns[session_id]}")
             return PromptResponse(stop_reason="end_turn")
@@ -279,6 +322,8 @@ class FakeAgent(Agent):
             raise RequestError.internal_error({"detail": "boom"})
 
         if command == "crash":
+            sys.stderr.write("fake agent: out of cheese, giving up\n")
+            sys.stderr.flush()
             os._exit(3)
 
         if command == "note":
@@ -313,5 +358,15 @@ class FakeAgent(Agent):
         await self.conn.session_update(session_id, AgentMessageChunk(content=TextContentBlock(text=text)))
 
 
-if __name__ == "__main__":
+def main() -> None:
+    if os.environ.get("FAKE_ACP_IGNORE_TERM") == "1":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if os.environ.get("FAKE_ACP_EXIT"):
+        sys.exit(int(os.environ["FAKE_ACP_EXIT"]))
     asyncio.run(run_agent(FakeAgent()))
+    if os.environ.get("FAKE_ACP_IGNORE_EOF") == "1":
+        time.sleep(3600)  # an agent that does not leave when its stdin closes
+
+
+if __name__ == "__main__":
+    main()
