@@ -6,10 +6,9 @@ on:
   push:
     branches: [ main ]
   schedule:
-    # Weekly canary against the newest SDK release. The template's open
-    # floor (strands-agents>=1.0.0) means new users always resolve the
-    # latest SDK — this catches SDK drift (removed exports, changed types)
-    # before a new user hits it.
+    # Weekly canary against the newest SDK release. New users always resolve
+    # the latest SDK, so this catches SDK drift (removed exports, changed
+    # types) before one of them hits it.
     - cron: '0 6 * * 1'
 
 permissions:
@@ -25,9 +24,10 @@ jobs:
     name: Test - Python ${{ matrix.python-version }}
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
       fail-fast: false
 
     steps:
@@ -52,6 +52,7 @@ jobs:
     name: Lint
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -69,7 +70,7 @@ jobs:
         run: pip install hatch
 
       - name: Check formatting
-        run: hatch run format
+        run: hatch run format-check
 
       - name: Run linter
         run: hatch run lint
@@ -77,10 +78,70 @@ jobs:
       - name: Type check
         run: hatch run typecheck
 
+  minimum-dependencies:
+    name: Test - oldest supported dependencies
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install hatch
+        run: pip install hatch
+
+      # The floors declared in pyproject.toml. If this fails, raise the floor there and here.
+      - name: Pin dependencies to their floors
+        run: |
+          hatch run pip install "strands-agents==1.56.0" "agent-client-protocol==1.0.0"
+          hatch run pip show strands-agents agent-client-protocol | grep -E "^(Name|Version)"
+
+      - name: Run tests
+        run: hatch run test
+
+  build:
+    name: Build and install the package
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check --strict dist/*
+
+      - name: Install the wheel and import it
+        run: |
+          python -m venv /tmp/wheel-check
+          /tmp/wheel-check/bin/pip install dist/*.whl
+          cd /tmp && /tmp/wheel-check/bin/python -c "import strands_acp_client as p; print(p.__version__, sorted(p.KNOWN_AGENTS))"
+
   sdk-compat:
     name: Latest SDK compatibility
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
