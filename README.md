@@ -78,7 +78,7 @@ The model sees one tool, `acp_agent`, with these inputs:
 | `task` | What the coding agent should do, with the context it needs to work on its own. |
 | `agent_name` | Which configured agent to use. Defaults to the first one (or `default_agent`). Left out when continuing a session. |
 | `session_id` | A `session_id` from an earlier result, to continue that conversation. |
-| `cwd` | Working directory for this call. Defaults to the factory's `cwd`. Left out when continuing a session. |
+| `cwd` | Working directory for this call: the factory's `cwd` (the default) or a directory inside it. Left out when continuing a session. |
 
 Every task is sent together with the absolute working directory, so relative paths in the task
 resolve even for an agent whose model cannot run `pwd`. The directory is resolved to its real path
@@ -106,12 +106,25 @@ list is short on purpose:
 
 | Name | Command | Verified with |
 | --- | --- | --- |
-| `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | Claude Code 2.1, adapter 0.101 |
-| `codex` | `npx -y @agentclientprotocol/codex-acp` | Codex adapter 2.6 on a local Ollama model |
-| `kilo` | `npx -y @kilocode/cli acp` | Kilo 7.8 on its free model, no account |
+| `claude` | `npx -y @agentclientprotocol/claude-agent-acp@0.101.0` | Claude Code 2.1, adapter 0.101 |
+| `codex` | `npx -y @agentclientprotocol/codex-acp@2.6.0` | Codex adapter 2.6 on a local Ollama model |
+| `kilo` | `npx -y @kilocode/cli@7.8.27 acp` | Kilo 7.8 on its free model, no account |
 | `opencode` | `opencode acp` | OpenCode 1.18 |
-| `qwen` | `npx -y @qwen-code/qwen-code --acp` | Qwen Code 0.27 on a local Ollama model |
-| `strands` | `npx -y @strands-agents/cli --acp-server` | Strands CLI 0.2.4 on a local Ollama model |
+| `qwen` | `npx -y @qwen-code/qwen-code@0.27.0 --acp` | Qwen Code 0.27 on a local Ollama model |
+| `strands` | `npx -y @strands-agents/cli@0.2.4 --acp-server` | Strands CLI 0.2.4 on a local Ollama model |
+
+Each `npx` command names the version that passed the suite. `npx -y` on a bare package name runs whatever
+its latest release happens to be, and a new release can change how the agent asks for permission. To run
+another version, pass its command under the same name; it keeps everything else the package knows about
+that agent:
+
+```python
+acp_agent = make_acp_agent(agents={"claude": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.102.0"]})
+```
+
+The model can send an agent to a directory inside the factory's `cwd`, by an absolute path or one relative
+to it, and nowhere else: the directory is the model's choice, and a prompt injection should not be able
+to point a coding agent at the rest of the machine. `confine_cwd=False` lifts that.
 
 Anything else that speaks ACP on stdin/stdout works by passing its command; the
 [ACP registry](https://github.com/agentclientprotocol/registry) lists them. An agent outside the table
@@ -241,10 +254,12 @@ permission request. So the tool does two more things under every policy except `
 1. **It puts the agent in a mode that respects the policy.** Each known agent declares, per policy,
    either the session mode in which it defers to the client, selected through ACP (`session/set_mode`
    or the `mode` config option) and reported as `mode` in the result, or the launch arguments that
-   restrict what it can do.
-2. **It checks that the agent asked** (`strict=True`, the default). If an edit, delete, move or command
-   completes without a permission request, the turn is cancelled at once and the tool returns an error
-   with `stop_reason: "policy_violation"` naming the call, instead of a success that hides it.
+   restrict what it can do. An agent that does not offer the mode declared for it is not started: the
+   call returns an error listing the modes it does offer.
+2. **It checks that the agent asked, and that it took no for an answer** (`strict=True`, the default).
+   If an edit, delete, move or command completes without a permission request, or after its request
+   was refused, the turn is cancelled at once and the tool returns an error with
+   `stop_reason: "policy_violation"` naming the call, instead of a success that hides it.
 
 | Agent | Starts in | Under a restrictive policy | An edit under `read_only` |
 | --- | --- | --- | --- |

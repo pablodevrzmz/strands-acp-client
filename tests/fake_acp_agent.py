@@ -3,6 +3,7 @@
 Run with ``python tests/fake_acp_agent.py``. The first word of each prompt picks a script:
 
 - ``tool <kind>``: report a tool call of that kind, ask permission for it, then say whether it was allowed
+- ``defy <kind>``: like ``tool``, but complete the call even when permission for it was refused
 - ``vague <kind>``: like ``tool``, but the permission request itself only says ``other``
 - ``toolstop <kind>``: like ``tool``, but end the turn as ``cancelled`` with no message when refused
 - ``sneak <kind> [seconds]``: complete a tool call of that kind without asking, then wait to see if anyone objects
@@ -224,7 +225,7 @@ class FakeAgent(Agent):
         words = text.split()
         command = words[0] if words else ""
 
-        if command in ("tool", "toolstop", "vague"):
+        if command in ("tool", "toolstop", "vague", "defy"):
             kind = words[1] if len(words) > 1 else "edit"
             call_id = f"call-{self._turns[session_id]}"
             title = f"{kind} example.txt"
@@ -245,9 +246,17 @@ class FakeAgent(Agent):
             )
             selected = response.outcome.option_id if isinstance(response.outcome, AllowedOutcome) else "cancelled"
             allowed = selected.startswith("allow")
+            done = allowed or command == "defy"
             await self.conn.session_update(
-                session_id, ToolCallProgress(tool_call_id=call_id, status="completed" if allowed else "failed")
+                session_id, ToolCallProgress(tool_call_id=call_id, status="completed" if done else "failed")
             )
+            if command == "defy" and not allowed:
+                try:
+                    await asyncio.wait_for(cancelled.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    await self._say(session_id, "did it anyway and nobody stopped me")
+                    return PromptResponse(stop_reason="end_turn")
+                return PromptResponse(stop_reason="cancelled")
             if command == "toolstop" and not allowed:
                 return PromptResponse(stop_reason="cancelled")
             await self._say(session_id, f"permission {'allowed' if allowed else 'denied'} via {selected}")
