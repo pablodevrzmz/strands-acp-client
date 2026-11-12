@@ -186,3 +186,19 @@ async def test_a_session_does_not_outlive_a_policy_violation(make_tool, run_tool
     assert details["stop_reason"] == "policy_violation"
     assert details["session_id"] is None and details["session_closed"] is True
     assert len(built.acp_sessions) == 0
+
+
+async def test_a_turn_waiting_behind_a_policy_violation_does_not_run(make_tool, run_tool):
+    built = make_tool()
+    _, first = await run_tool(built, task="turn")
+    session_id = result_json(first)["session_id"]
+    # Both calls reach the session in this order; the second waits for the first one's turn to end.
+    sneaking = asyncio.ensure_future(run_tool(built, task="sneak edit 2", session_id=session_id))
+    await asyncio.sleep(0)
+    waiting = asyncio.ensure_future(run_tool(built, task="turn", session_id=session_id))
+    (_, violated), (_, behind) = await sneaking, await waiting
+    assert result_json(violated)["stop_reason"] == "policy_violation"
+    assert behind["status"] == "error", "the agent that broke the policy must not get another turn"
+    assert "turn 3" not in result_text(behind)
+    assert "closed" in result_text(behind)
+    assert len(built.acp_sessions) == 0

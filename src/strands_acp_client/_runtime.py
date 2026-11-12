@@ -129,6 +129,14 @@ class Runtime:
                 post(True, outcome)
 
         future = self._submit(pump())
+
+        def on_done(done: concurrent.futures.Future[None]) -> None:
+            # A pump cancelled before its first step never reaches its ``finally``: answer for it. When
+            # it did post, this second last item is never read.
+            if done.cancelled():
+                post(True, RuntimeClosed("the tool was closed while the call was running"))
+
+        future.add_done_callback(on_done)
         finished = False
         try:
             while True:

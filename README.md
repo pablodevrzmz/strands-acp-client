@@ -322,10 +322,21 @@ it is garbage collected and when the interpreter exits.
 
 Each agent is started as the leader of its own process group, and closing addresses the group: its
 stdin is closed first, which is how an agent on stdio is told to leave, then the group gets SIGTERM, then
-SIGKILL. An agent launched through a wrapper, as `npx` does, cannot outlive its wrapper this way. Two
-consequences are worth knowing. A Ctrl-C in your terminal no longer reaches the agents directly; they
-end when the tool is closed or the interpreter exits. And on Windows, where there is no such group, only
-the launched process is terminated.
+SIGKILL. An agent launched through a wrapper, as `npx` does, cannot outlive its wrapper this way. On
+Windows, where there is no such group, only the launched process is terminated.
+
+The same group keeps a Ctrl-C in your terminal from reaching the agents. A Strands agent does not stop
+a running tool on Ctrl-C either, in a synchronous `agent(...)` call or under `asyncio.run`, so the
+interrupt only takes effect once the delegated turn is over, which can take up to `timeout` seconds. To
+stop it at once, cancel the agent when Ctrl-C arrives. The tool watches the agent's cancellation signal
+and cancels the coding agent's turn with it:
+
+```python
+import signal
+
+signal.signal(signal.SIGINT, lambda *_: agent.cancel())
+result = agent("Ask claude to explain src/http.py.")  # ends with stop_reason "cancelled" on Ctrl-C
+```
 
 ## Watching the agent work
 
@@ -361,7 +372,10 @@ can edit and run freely inside the sandbox, and follow-up turns reuse the proces
   agent with an interrupt and asks a human is planned.
 - The agents' own authentication is not handled here; log in as you would in a terminal.
 - A process that forks after using the tool gets a child with no sessions of its own: the agents stay
-  with the parent, and the child starts new ones on its first call.
+  with the parent, and the child starts new ones on its first call. While such a child is alive it also
+  holds the agents' pipes open, so when the parent closes the tool its agents do not see their input end
+  and are stopped with SIGTERM after two seconds instead. Create the tool after forking (in each worker of
+  a prefork server, for instance) to avoid that.
 
 ## Development
 

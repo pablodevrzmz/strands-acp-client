@@ -72,6 +72,13 @@ class AcpAgentTool(DecoratedFunctionTool[..., Any]):
         except Exception:  # half-built, or the interpreter is being torn down
             pass
 
+    def __copy__(self) -> AcpAgentTool:
+        # A copy would share the agent processes, and dropping it would end them under the original.
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> AcpAgentTool:
+        return self
+
     def __get__(self, instance: Any, obj_type: type | None = None) -> AcpAgentTool:
         # The function behind this tool is not a method. Kept as a class attribute, the tool must
         # not be re-bound to whichever instance reaches it, which is what a decorated method does.
@@ -84,7 +91,10 @@ class AcpAgentTool(DecoratedFunctionTool[..., Any]):
         :meth:`aclose` instead. The tool can be used again afterwards.
         """
         self._runtime.stop(self.acp_sessions.drop_all)
-        self.acp_sessions.kill_all()  # anything the loop did not get to
+        if not self._runtime.running:
+            # Anything the loop did not get to. Not while its thread is still at work: the registry is
+            # that thread's to touch.
+            self.acp_sessions.kill_all()
 
     async def aclose(self) -> None:
         """:meth:`close`, without holding up the event loop that awaits it."""
@@ -338,10 +348,14 @@ class _Delegator:
                     else:
                         yield item
         finally:
-            # A session outlives a turn that failed, timed out or was cancelled, as long as its agent
-            # is still there to talk to. It does not outlive a change made behind the policy's back.
-            keep = settings.keep_sessions and result is not None and result.violation is None
-            await self._registry.release(session, keep)
+            # A session outlives a turn that failed, timed out or was cancelled, and a caller that
+            # stopped listening, as long as its agent is still there to talk to. It does not outlive a
+            # change made behind the policy's back: it is closed at once, so that a turn waiting for it
+            # does not start on that agent.
+            violated = result is not None and result.violation is not None
+            if violated:
+                await session.close()
+            await self._registry.release(session, settings.keep_sessions and not violated)
 
         if result is None:
             yield _error(f"agent {session.agent_name!r} produced no result")

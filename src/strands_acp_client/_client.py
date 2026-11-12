@@ -174,10 +174,13 @@ class StrandsAcpClient(Client):
             options=tuple(options),
             raw_input=tool_call.raw_input,
         )
-        if turn is not None:
-            turn.asked.add(request.tool_call_id)
+        if turn is None:
+            # Outside a turn there is no call to answer for, and no event loop of the application to
+            # run a handler on. Nobody said yes, so the answer is no.
+            return RequestPermissionResponse(outcome=DeniedOutcome())
+        turn.asked.add(request.tool_call_id)
         try:
-            response, allowed = await decide(self.policy, request, turn.home if turn is not None else None)
+            response, allowed = await decide(self.policy, request, turn.home)
         except CallerGone:
             # The call this turn belongs to is no longer there to be asked, and the turn is on its
             # way to being cancelled. Nobody said yes, so the answer is no.
@@ -189,21 +192,20 @@ class StrandsAcpClient(Client):
             # The agent will not ask again for this kind of call in this session.
             self._always_allowed.add(request.kind)
 
-        if turn is not None:
-            if allowed:
-                turn.allowed += 1
-            else:
-                turn.denied += 1
-                turn.refused.append(_describe_call(request.title, request.kind))
-            turn.push(
-                {
-                    "type": "permission",
-                    "tool_call_id": request.tool_call_id,
-                    "title": request.title,
-                    "kind": request.kind,
-                    "allowed": allowed,
-                }
-            )
+        if allowed:
+            turn.allowed += 1
+        else:
+            turn.denied += 1
+            turn.refused.append(_describe_call(request.title, request.kind))
+        turn.push(
+            {
+                "type": "permission",
+                "tool_call_id": request.tool_call_id,
+                "title": request.title,
+                "kind": request.kind,
+                "allowed": allowed,
+            }
+        )
         return response
 
     async def create_elicitation(self, message: str, mode: ElicitationMode, **kwargs: Any) -> CreateElicitationResponse:
