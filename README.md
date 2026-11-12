@@ -22,6 +22,8 @@ task and decides its permission requests.
 pip install strands-acp-client
 ```
 
+It needs Python 3.10 or newer and `strands-agents` 1.56 or newer.
+
 The agents themselves are separate programs. Claude Code's adapter and the Strands CLI run through
 `npx`, so Node.js 20+ must be on `PATH`; OpenCode is a binary you install first. Each agent needs its
 own login or model provider exactly as it does in a terminal (for example `claude auth login` for
@@ -46,7 +48,8 @@ import os
 hide_host_session = {
     key: None
     for key in os.environ
-    if key == "CLAUDECODE" or key.startswith(("CLAUDE_CODE_", "CLAUDE_AGENT_SDK_"))
+    if key == "CLAUDECODE"
+    or (key.startswith(("CLAUDE_CODE_", "CLAUDE_AGENT_SDK_")) and key != "CLAUDE_CODE_OAUTH_TOKEN")
 }
 acp_agent = make_acp_agent(agents=["claude"], env=hide_host_session)
 ```
@@ -84,8 +87,8 @@ Every task is sent together with the absolute working directory, so relative pat
 resolve even for an agent whose model cannot run `pwd`. The directory is resolved to its real path
 first: an agent that sees a symlinked path treats its own project as an external folder.
 
-Each result carries the agent's final message as text plus a JSON block with `session_id`,
-`stop_reason`, token `usage` (when the agent reports it), the `tool_calls` it made (id, title,
+Each result carries the text the agent wrote during the turn (every message chunk, joined in order)
+plus a JSON block with `session_id`, `stop_reason`, token `usage` (when the agent reports it), the `tool_calls` it made (id, title,
 ACP kind, status, file locations), how many permission requests were allowed or denied, and the
 elapsed time. When requests were refused, the text ends with a line naming them, because an agent
 does not always say that it was turned down. An agent that ends its turn right after a refusal, as
@@ -231,7 +234,8 @@ from strands_acp_client import PermissionRequest, make_acp_agent
 def inside_src_only(request: PermissionRequest) -> bool:
     if request.kind in ("read", "search", "fetch", "think"):
         return True
-    return request.kind == "edit" and all("/src/" in path for path in request.locations)
+    # An edit that names no file is refused: all() of nothing is True, and would let it through.
+    return request.kind == "edit" and bool(request.locations) and all("/src/" in path for path in request.locations)
 
 acp_agent = make_acp_agent(agents=["claude"], permissions=inside_src_only)
 ```
@@ -385,7 +389,9 @@ can edit and run freely inside the sandbox, and follow-up turns reuse the proces
   policy and `strict` hold a cooperative agent to the rules; they are not a sandbox.
 - Permission requests are answered by policy or by your callable. A mode that pauses the Strands
   agent with an interrupt and asks a human is planned.
-- The agents' own authentication is not handled here; log in as you would in a terminal.
+- Credentials stay with the agents: log in as you would in a terminal, or give the agent its key in the
+  environment. The one step the tool takes is ACP's `authenticate` call, for an agent that asks for it
+  and has an `auth_method` configured, as the `codex` preset does.
 - A process that forks after using the tool gets a child with no sessions of its own: the agents stay
   with the parent, and the child starts new ones on its first call. While such a child is alive it also
   holds the agents' pipes open, so when the parent closes the tool its agents do not see their input end
@@ -419,8 +425,9 @@ it and those three need no account and no key:
 ```bash
 ACP_E2E_AGENTS='strands+--model ollama/qwen3.8:27b --memory off' hatch run test tests/e2e -v -s
 ```
-The `agent-client-protocol` SDK supports Python 3.10 to 3.14; if Hatch picks a newer interpreter,
-point it at a supported one with `HATCH_PYTHON=/path/to/python3.14`.
+CI runs the suite on Python 3.10 to 3.14, and once more against the oldest supported versions of
+Strands and the ACP SDK. If Hatch picks a newer interpreter, point it at one of those with
+`HATCH_PYTHON=/path/to/python3.14`.
 
 ## License
 
