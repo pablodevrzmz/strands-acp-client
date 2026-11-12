@@ -145,6 +145,7 @@ def make_acp_agent(
     agents: AgentsArg = None,
     default_agent: str | None = None,
     cwd: str | os.PathLike[str] | None = None,
+    confine_cwd: bool = True,
     timeout: float = 600.0,
     startup_timeout: float = 120.0,
     permissions: PermissionPolicy = "read_only",
@@ -164,7 +165,9 @@ def make_acp_agent(
             known-agent names, or ``None`` for Claude Code only. See ``KNOWN_AGENTS``.
         default_agent: Agent used when the model does not pick one. Defaults to the first configured.
         cwd: Working directory the agents are started in. Defaults to the current directory.
-            The model may pass another directory per call.
+            The model may pass another directory per call, inside this one.
+        confine_cwd: Refuse a per-call directory outside ``cwd``. The model chooses that directory,
+            so ``False`` lets whatever steers the model send a coding agent anywhere on the machine.
         timeout: Seconds a single task may run before the turn is cancelled.
         startup_timeout: Seconds an agent may take to start and open its session. A first run
             through ``npx`` downloads the agent, which is why the default is generous.
@@ -216,6 +219,7 @@ def make_acp_agent(
         env=env,
         keep_sessions=keep_sessions,
         cancel_grace=cancel_grace,
+        confine_cwd=confine_cwd,
     )
     runtime = Runtime(f"strands-acp-client:{name}")
     registry = SessionRegistry(runtime, max_sessions=max_sessions)
@@ -261,6 +265,7 @@ class _Settings:
     env: Mapping[str, str | None] | None
     keep_sessions: bool
     cancel_grace: float
+    confine_cwd: bool
 
     @property
     def policy(self) -> str:
@@ -303,9 +308,16 @@ class _Delegator:
         if not task or not task.strip():
             yield _error("task must not be empty")
             return
-        work_dir = os.path.realpath(cwd) if cwd else None
+        # A relative path is relative to the tool's directory, not to wherever this process runs.
+        base = self._settings.base_cwd
+        work_dir = os.path.realpath(os.path.join(base, cwd)) if cwd else None
         if work_dir is not None and not os.path.isdir(work_dir):
             yield _error(f"cwd {work_dir!r} is not a directory")
+            return
+        if work_dir is not None and self._settings.confine_cwd and os.path.commonpath([base, work_dir]) != base:
+            # The directory is chosen by the model. Left unchecked, a prompt injection could point
+            # a coding agent at any folder this process can reach.
+            yield _error(f"cwd {work_dir!r} is outside the tool's working directory {base!r}")
             return
         call = _Call(task, agent_name or None, session_id or None, work_dir, cancel_signal, asyncio.get_running_loop())
         try:
@@ -415,6 +427,7 @@ def _describe(settings: _Settings) -> str:
 
 
 def _input_schema(settings: _Settings) -> dict[str, Any]:
+    inside = ": that directory or one inside it, absolute or relative to it" if settings.confine_cwd else ""
     return {
         "type": "object",
         "properties": {
@@ -435,7 +448,8 @@ def _input_schema(settings: _Settings) -> dict[str, Any]:
             },
             "cwd": {
                 "type": "string",
-                "description": f"Working directory for the agent. Defaults to {settings.base_cwd}. Leave it out "
+                "description": f"Working directory for the agent{inside}. Defaults to {settings.base_cwd}. "
+                "Leave it out "
                 "when continuing a session: the session stays in its own directory.",
             },
         },

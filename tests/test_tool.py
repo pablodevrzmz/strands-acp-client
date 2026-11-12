@@ -375,17 +375,25 @@ async def test_mode_is_selected_through_the_config_option(make_tool, run_tool):
     assert result_json(result)["mode"] == "plan"
 
 
-async def test_a_mode_the_agent_does_not_offer_is_skipped(make_tool, run_tool):
+async def test_a_mode_the_agent_does_not_offer_stops_the_session(make_tool, run_tool):
+    # The mode is what makes the agent ask. Without it the policy would restrict nothing.
     command = AgentCommand(FAKE_ARGV, "fake", modes={"read_only": "nope"})
-    _, result = await run_tool(make_tool(agents={"fake": command}, env={"FAKE_ACP_MODES": "ask,auto"}), task="mode")
-    assert result_text(result) == "mode auto"
-    assert result_json(result)["mode"] is None
+    built = make_tool(agents={"fake": command}, env={"FAKE_ACP_MODES": "ask,auto"})
+    _, result = await run_tool(built, task="mode")
+    assert result["status"] == "error"
+    assert "does not offer the mode 'nope' that the read_only policy needs" in result_text(result)
+    assert "it offers: ask, auto" in result_text(result)
+    assert len(built.acp_sessions) == 0
+
+    # A policy the command names no mode for is not affected.
+    _, free = await run_tool(make_tool(agents={"fake": command}, permissions="allow_all"), task="mode")
+    assert free["status"] == "success"
 
 
 def test_known_agents_carry_their_asking_modes():
     from strands_acp_client._agents import resolve_agents
 
-    pinned = resolve_agents({"claude": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.101.0"]})
+    pinned = resolve_agents({"claude": ["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.99.0"]})
     assert pinned["claude"].modes == {"read_only": "default", "deny_all": "default", "custom": "default"}
     assert resolve_agents(["opencode"])["opencode"].modes == {"read_only": "plan", "deny_all": "plan"}
     assert resolve_agents(["qwen"])["qwen"].modes == pinned["claude"].modes
@@ -407,7 +415,7 @@ async def test_with_args_adds_flags_and_keeps_what_is_known(make_tool, run_tool)
     pinned = command.with_args("--model", "local/tiny", "")
     assert pinned.argv == (*FAKE_ARGV, "--model", "local/tiny", "")
     assert pinned.modes == command.modes and pinned.policy_args == command.policy_args
-    _, result = await run_tool(make_tool(agents={"fake": pinned}), task="argv")
+    _, result = await run_tool(make_tool(agents={"fake": pinned}, env={"FAKE_ACP_MODES": "ask,auto"}), task="argv")
     assert result_text(result).startswith("--model local/tiny")
     assert result_text(result).endswith("--tools read")
 
@@ -502,9 +510,9 @@ async def test_sandboxed_kinds_are_exempt_only_once_the_mode_is_active(make_tool
     _, editing = await run_tool(with_mode, task="sneak edit")
     assert result_json(editing)["stop_reason"] == "policy_violation", "an unasked edit is still a violation"
 
-    # The agent does not offer the mode, so nothing guarantees the sandbox: commands are guarded again.
-    without_mode = make_tool(agents={"fake": command})
-    _, unguarded = await run_tool(without_mode, task="sneak execute")
+    # A policy with no mode of its own gets no such guarantee: commands are guarded again.
+    custom = make_tool(agents={"fake": command}, env={"FAKE_ACP_MODES": "ask,auto"}, permissions=lambda request: False)
+    _, unguarded = await run_tool(custom, task="sneak execute")
     assert result_json(unguarded)["stop_reason"] == "policy_violation"
 
 
@@ -601,3 +609,111 @@ async def test_the_working_directory_is_resolved_to_its_real_path(make_tool, run
     assert result_text(result) == f"Working directory: {os.path.realpath(real)}"
     _, per_call = await run_tool(make_tool(), task="note", cwd=str(link))
     assert result_text(per_call) == f"Working directory: {os.path.realpath(real)}"
+
+
+# ── the guard and the policy, as the review left them ──
+
+
+async def test_a_refused_call_that_completes_anyway_is_a_violation(make_tool, run_tool):
+    built = make_tool()
+    events, result = await run_tool(built, task="defy edit")
+    assert result["status"] == "error"
+    details = result_json(result)
+    assert details["stop_reason"] == "policy_violation"
+    assert details["policy_violation"] == {
+        "tool_call_id": "call-1",
+        "title": "edit example.txt",
+        "kind": "edit",
+        "refused": True,
+    }
+    assert "after permission for it was refused" in result_text(result)
+    assert "nobody stopped me" not in result_text(result)
+
+    # Asking is no excuse for a kind the agent is trusted to sandbox, either.
+    command = AgentCommand(FAKE_ARGV, "fake", modes={"read_only": "ask"}, sandboxed_kinds=("execute",))
+    sandboxed = make_tool(agents={"fake": command}, env={"FAKE_ACP_MODES": "ask,auto"})
+    _, defied = await run_tool(sandboxed, task="defy execute")
+    assert result_json(defied)["stop_reason"] == "policy_violation"
+
+    # With strict off nothing is checked, as before.
+    _, loose = await run_tool(make_tool(strict=False), task="defy edit")
+    assert loose["status"] == "success"
+
+
+async def test_cancelling_a_turn_answers_the_open_permission_request(make_tool, run_tool):
+    import asyncio
+    import threading
+
+    asked = threading.Event()
+    cancel_signal = threading.Event()
+    left: list[str] = []
+
+    async def never_decides(request):
+        asked.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            left.append("cancelled")
+            raise
+        return True
+
+    built = make_tool(permissions=never_decides, timeout=30)
+    threading.Thread(target=lambda: (asked.wait(10), cancel_signal.set())).start()
+    started = time.perf_counter()
+    _, result = await run_tool(built, task="tool edit", cancel_signal=cancel_signal)
+    assert time.perf_counter() - started < 8
+    details = result_json(result)
+    assert details["stop_reason"] == "cancelled"
+    assert details["tool_calls"][0]["status"] == "failed", "the agent was told no, and did not make the edit"
+    assert details["session_id"] in built.acp_sessions.session_ids, "the agent got its answer and stopped cleanly"
+    assert left == ["cancelled"], "the handler is not left waiting for an answer nobody wants"
+
+
+def test_agent_commands_are_checked_when_they_are_written():
+    with pytest.raises(ValueError, match="not one string"):
+        AgentCommand("npx -y some-agent")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=r"modes has unknown policies \['readonly'\]"):
+        AgentCommand(("agent",), modes={"readonly": "ask"})
+    with pytest.raises(ValueError, match="policy_args has unknown policies"):
+        AgentCommand(("agent",), policy_args={"read-only": ("--safe",)})
+    assert AgentCommand(["agent", "--acp"]).argv == ("agent", "--acp")  # type: ignore[arg-type]
+
+
+def test_another_version_of_a_known_agent_keeps_what_is_known_about_it():
+    from strands_acp_client._agents import resolve_agents
+
+    kilo = resolve_agents({"kilo": ["npx", "-y", "@kilocode/cli@7.9.0", "acp"]})["kilo"]
+    assert kilo.argv == ("npx", "-y", "@kilocode/cli@7.9.0", "acp")
+    assert kilo.config == KNOWN_AGENTS["kilo"].config and kilo.sandboxed_kinds == ("execute",)
+    codex = resolve_agents({"codex": ["codex-acp"]})["codex"]
+    assert codex.auth_method == "api-key" and codex.env == {"NO_BROWSER": "1"}
+    assert codex.modes == KNOWN_AGENTS["codex"].modes
+
+
+def test_presets_name_the_version_that_was_verified():
+    for name, command in KNOWN_AGENTS.items():
+        if command.argv[0] == "npx":
+            package = command.argv[2]
+            assert "@" in package.lstrip("@"), f"{name} runs whatever {package} releases next"
+
+
+async def test_the_models_directory_stays_inside_the_tools(make_tool, run_tool, tmp_path):
+    inside = tmp_path / "pkg"
+    inside.mkdir()
+    built = make_tool()
+    _, relative = await run_tool(built, task="note", cwd="pkg")
+    assert result_text(relative) == f"Working directory: {os.path.realpath(inside)}", "relative to the tool's cwd"
+
+    outside = tmp_path.parent
+    for attempt in (str(outside), "..", "pkg/../.."):
+        _, refused = await run_tool(built, task="note", cwd=attempt)
+        assert refused["status"] == "error", attempt
+        assert "is outside the tool's working directory" in result_text(refused)
+    escape = tmp_path / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    _, linked = await run_tool(built, task="note", cwd="escape")
+    assert "is outside the tool's working directory" in result_text(linked), "a symlink does not get around it"
+    assert len(built.acp_sessions) == 1
+
+    _, free = await run_tool(make_tool(confine_cwd=False), task="note", cwd=str(outside))
+    assert result_text(free) == f"Working directory: {os.path.realpath(outside)}"

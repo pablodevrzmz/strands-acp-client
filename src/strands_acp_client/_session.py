@@ -257,7 +257,11 @@ class AcpSession:
         await conn.authenticate(method_id=method)
 
     async def _select_mode(self, conn: ClientSideConnection, opened: Any) -> None:
-        """Switch the session to the mode this agent needs for the current policy, if it offers it."""
+        """Switch the session to the mode this agent needs for the current policy.
+
+        An agent that does not offer that mode is not started: it would be left in a mode where it
+        acts without asking, and the policy would restrict nothing.
+        """
         wanted = (self.command.modes or {}).get(self.policy_label)
         if not wanted or opened is None:
             return
@@ -273,7 +277,15 @@ class AcpSession:
                     await conn.set_config_option(config_id="mode", session_id=self.session_id, value=wanted)
                 self.mode = wanted
                 return
-        logger.info("agent %r does not offer mode %r; relying on its own defaults", self.agent_name, wanted)
+        offered = [str(mode.id) for mode in modes.available_modes] if modes is not None else []
+        for option in getattr(opened, "config_options", None) or []:
+            if getattr(option, "id", None) == "mode":
+                offered.extend(value for value in _select_values(option) if value not in offered)
+        raise AcpAgentError(
+            f"agent {self.agent_name!r} does not offer the mode {wanted!r} that the {self.policy_label} policy "
+            f"needs from it; it offers: {', '.join(offered) or 'none'}. Without that mode the agent could act "
+            "without asking, so the session was not started"
+        )
 
     async def _apply_config(self, conn: ClientSideConnection, opened: Any) -> None:
         """Set the session options configured for this agent (its model, for instance)."""
@@ -432,6 +444,7 @@ class AcpSession:
         The grace period covers sending the cancellation too: an agent that stopped reading its
         stdin never receives it, and must not hold the turn past its deadline.
         """
+        self.client.stop_asking()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.spec.cancel_grace
         with contextlib.suppress(Exception):
@@ -470,9 +483,10 @@ class AcpSession:
         elif stopped == "policy_violation":
             stop_reason = "policy_violation"
             violation = turn.violation or {}
+            how = "after permission for it was refused" if violation.get("refused") else "without asking for permission"
             error = (
-                f"the agent ran {violation.get('title') or 'a tool'!r} ({violation.get('kind')}) without asking "
-                f"for permission, so the {self.policy_label} policy could not be enforced and the turn was "
+                f"the agent ran {violation.get('title') or 'a tool'!r} ({violation.get('kind')}) {how}, "
+                f"so the {self.policy_label} policy could not be enforced and the turn was "
                 "stopped; that change may already have been made"
             )
         elif not finished:

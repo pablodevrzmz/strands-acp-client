@@ -8,6 +8,9 @@ from dataclasses import dataclass, replace
 __all__ = ["KNOWN_AGENTS", "AgentCommand", "resolve_agents"]
 
 
+_POLICY_LABELS = ("read_only", "deny_all", "custom", "allow_all")
+
+
 @dataclass(frozen=True)
 class AgentCommand:
     """How to start an agent that speaks the Agent Client Protocol on stdin/stdout.
@@ -47,8 +50,19 @@ class AgentCommand:
     sandboxed_kinds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if isinstance(self.argv, str):
+            # tuple("npx -y x") would be one argument per letter.
+            raise ValueError(f"argv must be a sequence of strings, not one string; use shlex.split({self.argv!r})")
+        object.__setattr__(self, "argv", tuple(self.argv))
         if not self.argv or not self.argv[0] or not all(isinstance(part, str) for part in self.argv):
             raise ValueError("argv must be a non-empty sequence of strings starting with the program to run")
+        for field_name in ("modes", "policy_args"):
+            unknown = sorted(set(getattr(self, field_name) or {}) - set(_POLICY_LABELS))
+            if unknown:
+                # A misspelled policy would be ignored, and the agent left in a mode that does not ask.
+                raise ValueError(
+                    f"{field_name} has unknown policies {unknown}; the policies are {list(_POLICY_LABELS)}"
+                )
 
     def with_args(self, *args: str) -> AgentCommand:
         """A copy of this command with more arguments, keeping its description, modes and policy arguments.
@@ -92,12 +106,12 @@ _SANDBOX_READ_ONLY = {"read_only": "read-only", "deny_all": "read-only", "custom
 
 KNOWN_AGENTS: dict[str, AgentCommand] = {
     "claude": AgentCommand(
-        ("npx", "-y", "@agentclientprotocol/claude-agent-acp"),
+        ("npx", "-y", "@agentclientprotocol/claude-agent-acp@0.101.0"),
         "Claude Code through the official ACP adapter",
         modes=_ASK_FIRST,
     ),
     "codex": AgentCommand(
-        ("npx", "-y", "@agentclientprotocol/codex-acp"),
+        ("npx", "-y", "@agentclientprotocol/codex-acp@2.6.0"),
         "OpenAI Codex through the official ACP adapter",
         env={"NO_BROWSER": "1"},  # a tool call must never try to open a browser to log in
         modes=_SANDBOX_READ_ONLY,
@@ -105,12 +119,12 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
         sandboxed_kinds=("execute",),
     ),
     "qwen": AgentCommand(
-        ("npx", "-y", "@qwen-code/qwen-code", "--acp"),
+        ("npx", "-y", "@qwen-code/qwen-code@0.27.0", "--acp"),
         "Qwen Code",
         modes=_ASK_FIRST,
     ),
     "kilo": AgentCommand(
-        ("npx", "-y", "@kilocode/cli", "acp"),
+        ("npx", "-y", "@kilocode/cli@7.8.27", "acp"),
         "Kilo, an open source coding agent",
         modes={"read_only": "ask", "deny_all": "ask"},
         config={"model": "kilo/kilo-auto/free"},
@@ -122,14 +136,16 @@ KNOWN_AGENTS: dict[str, AgentCommand] = {
         modes=_PLAN_ONLY,
     ),
     "strands": AgentCommand(
-        ("npx", "-y", "@strands-agents/cli", "--acp-server"),
+        ("npx", "-y", "@strands-agents/cli@0.2.4", "--acp-server"),
         "A Strands agent served over ACP by the Strands CLI",
         policy_args={"read_only": _READ_TOOLS, "deny_all": _READ_TOOLS},
     ),
 }
 """Agents this package has been driven against end to end, with what was learned about each.
 
-An agent is added here only after the suite in ``tests/e2e`` passes against the real thing. Any other
+An agent is added here only after the suite in ``tests/e2e`` passes against the real thing, and its
+command names the version that passed: ``npx -y`` runs whatever a package's latest release happens to be,
+and a new release may ask for permission differently. Any other
 agent that speaks ACP works by passing its command (the ACP registry lists them:
 https://github.com/agentclientprotocol/registry), but nothing here has checked how it asks for permission.
 """
@@ -143,9 +159,10 @@ def resolve_agents(agents: AgentsArg) -> dict[str, AgentCommand]:
 
     Accepts a mapping of name to argv / :class:`AgentCommand` / known-agent alias, a list of
     known-agent names, a single known-agent name, or ``None`` (Claude Code only). A plain argv
-    given under a known name keeps that agent's description and modes, so pinning a version
-    does not lose them; its policy arguments are not carried over, because they are written for
-    the stock command. To add flags to a known agent, use :meth:`AgentCommand.with_args`.
+    given under a known name keeps everything the package knows about that agent (its modes, session
+    options, environment, authentication method and sandboxed kinds), so choosing another version
+    does not lose them. Only its policy arguments are not carried over, because they are written
+    for the stock command. To add flags to a known agent, use :meth:`AgentCommand.with_args`.
     """
     if agents is None:
         return {"claude": KNOWN_AGENTS["claude"]}
@@ -162,11 +179,8 @@ def resolve_agents(agents: AgentsArg) -> dict[str, AgentCommand]:
                 resolved[name] = _known(spec)
             else:
                 known = KNOWN_AGENTS.get(name)
-                resolved[name] = AgentCommand(
-                    tuple(spec),
-                    known.description if known else "",
-                    modes=known.modes if known else None,
-                )
+                command = AgentCommand(tuple(spec))
+                resolved[name] = replace(known, argv=command.argv, policy_args=None) if known else command
     else:
         for name in agents:
             _check_name(name)

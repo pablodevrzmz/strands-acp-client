@@ -65,6 +65,11 @@ class Turn:
         self.denied = 0
         self.refused: list[str] = []
         self.asked: set[str] = set()
+        self.refused_ids: set[str] = set()
+        # Permission requests still being decided, and whether the turn is being stopped: when it
+        # is, ACP wants every one of them answered as cancelled.
+        self.deciding: set[asyncio.Future[Any]] = set()
+        self.stopping = False
         self.violation: dict[str, Any] | None = None
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -142,16 +147,32 @@ class StrandsAcpClient(Client):
         # Plans, available commands, mode and config changes are not needed for a delegated task.
 
     def _check(self, turn: Turn, entry: dict[str, Any]) -> None:
-        """Flag a completed edit, delete, move or command that the agent never asked permission for."""
+        """Flag a completed edit, delete, move or command that the policy did not allow.
+
+        Either the agent never asked about it, or it asked, was refused and went ahead anyway.
+        """
         if not self.guard or turn.violation is not None:
             return
         kind = entry["kind"]
-        if entry["status"] != "completed" or kind not in MUTATING_KINDS or kind in self.exempt_kinds:
+        if entry["status"] != "completed" or kind not in MUTATING_KINDS:
             return
-        if entry["id"] in turn.asked or kind in self._always_allowed:
-            return
+        refused = entry["id"] in turn.refused_ids
+        if not refused:
+            if entry["id"] in turn.asked or kind in self._always_allowed or kind in self.exempt_kinds:
+                return
         turn.violation = {"tool_call_id": entry["id"], "title": entry["title"], "kind": kind}
+        if refused:
+            turn.violation["refused"] = True
         turn.push({"type": "policy_violation", **turn.violation})
+
+    def stop_asking(self) -> None:
+        """Answer every permission request still open as cancelled; the turn is being stopped."""
+        turn = self.turn
+        if turn is None:
+            return
+        turn.stopping = True
+        for deciding in list(turn.deciding):
+            deciding.cancel()
 
     # ── what the agent asks ──
 
@@ -179,8 +200,21 @@ class StrandsAcpClient(Client):
             # run a handler on. Nobody said yes, so the answer is no.
             return RequestPermissionResponse(outcome=DeniedOutcome())
         turn.asked.add(request.tool_call_id)
+        refusal = RequestPermissionResponse(outcome=DeniedOutcome())
+        if turn.stopping:
+            turn.refused_ids.add(request.tool_call_id)
+            return refusal
+        deciding = asyncio.ensure_future(decide(self.policy, request, turn.home))
+        turn.deciding.add(deciding)
         try:
-            response, allowed = await decide(self.policy, request, turn.home)
+            response, allowed = await deciding
+        except asyncio.CancelledError:
+            deciding.cancel()
+            if not turn.stopping:
+                raise
+            # The turn was cancelled while this was being decided. ACP asks the client to answer
+            # what is still open as cancelled, which is also what a refusal looks like here.
+            response, allowed = refusal, False
         except CallerGone:
             # The call this turn belongs to is no longer there to be asked, and the turn is on its
             # way to being cancelled. Nobody said yes, so the answer is no.
@@ -188,6 +222,8 @@ class StrandsAcpClient(Client):
         except Exception:
             logger.exception("permission handler failed for %s; refusing the call", request.title)
             response, allowed = RequestPermissionResponse(outcome=DeniedOutcome()), False
+        finally:
+            turn.deciding.discard(deciding)
         if allowed and request.kind and _selected_kind(response, options) == "allow_always":
             # The agent will not ask again for this kind of call in this session.
             self._always_allowed.add(request.kind)
@@ -196,6 +232,7 @@ class StrandsAcpClient(Client):
             turn.allowed += 1
         else:
             turn.denied += 1
+            turn.refused_ids.add(request.tool_call_id)
             turn.refused.append(_describe_call(request.title, request.kind))
         turn.push(
             {
